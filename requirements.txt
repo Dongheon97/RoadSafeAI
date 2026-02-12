@@ -1,0 +1,13 @@
+numpy==2.0.2
+llvmlite==0.43.0
+numba==0.60.0
+torch>=1.1
+tensorboardX
+easydict
+pyyaml
+scikit-image
+tqdm
+torchvision
+SharedArray
+opencv-python
+pyquaternion

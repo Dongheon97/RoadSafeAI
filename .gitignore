@@ -209,6 +209,7 @@ __marimo__/
 # Dataset and model artifacts
 data/
 pcdet/models/*.pth
+output/
 tools/custom_dataset_bev.png
 tools/cfgs/target_custom/label_generation/round*/ps_labels/
 tools/output/

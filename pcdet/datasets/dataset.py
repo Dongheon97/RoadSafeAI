@@ -1,8 +1,8 @@
+import torch
 from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
-import torch
 import torch.utils.data as torch_data
 
 from ..utils import common_utils
@@ -10,6 +10,8 @@ from .augmentor.data_augmentor import DataAugmentor
 from .processor.data_processor import DataProcessor
 from .processor.point_feature_encoder import PointFeatureEncoder
 
+from ..utils import common_utils, self_training_utils
+from ..ops.roiaware_pool3d import roiaware_pool3d_utils
 
 class DatasetTemplate(torch_data.Dataset):
     def __init__(self, dataset_cfg=None, class_names=None, training=True, root_path=None, logger=None):
@@ -30,7 +32,13 @@ class DatasetTemplate(torch_data.Dataset):
         )
         self.data_augmentor = DataAugmentor(
             self.root_path, self.dataset_cfg.DATA_AUGMENTOR, self.class_names, logger=self.logger
-        ) if self.training else None
+        ) if self.training or self.dataset_cfg.get('USE_TTA', False) else None
+        if self.dataset_cfg.get('USE_TTA',False):
+            for aug in self.dataset_cfg.DATA_AUGMENTOR.AUG_CONFIG_LIST:
+                if aug['NAME'] not in ['random_world_flip','random_world_rotation']:
+                    print(f'ERROR: {aug["NAME"]} not supported for TTA\n')
+                    raise NotImplementedError            
+
         self.data_processor = DataProcessor(
             self.dataset_cfg.DATA_PROCESSOR, point_cloud_range=self.point_cloud_range,
             training=self.training, num_point_features=self.point_feature_encoder.num_point_features
@@ -89,7 +97,10 @@ class DatasetTemplate(torch_data.Dataset):
             pred_dict = get_template_prediction(pred_scores.shape[0])
             if pred_scores.shape[0] == 0:
                 return pred_dict
-
+            
+            if self.dataset_cfg.get('SHIFT_COOR', None):
+                pred_boxes[:, 0:3] -= self.dataset_cfg.SHIFT_COOR
+                
             pred_dict['name'] = np.array(class_names)[pred_labels - 1]
             pred_dict['score'] = pred_scores
             pred_dict['boxes_lidar'] = pred_boxes
@@ -97,6 +108,23 @@ class DatasetTemplate(torch_data.Dataset):
 
             return pred_dict
 
+        if not self.training and self.dataset_cfg.get('USE_TTA', False):
+            from .augmentor import augmentor_utils
+            # Need to undo the data augmentations in reverse order
+            for aug in reversed(self.dataset_cfg.DATA_AUGMENTOR.AUG_CONFIG_LIST):
+                if aug['NAME'] == 'random_world_flip':
+                    if 'flip_x' in batch_dict.keys():
+                        for idx, enable in enumerate(batch_dict['flip_x']):
+                            pred_dicts[idx]['pred_boxes'], _ = augmentor_utils.random_flip_along_x(pred_dicts[idx]['pred_boxes'], np.zeros((1,3)), enable=bool(enable))
+                    if 'flip_y' in batch_dict.keys():
+                        for idx, enable in enumerate(batch_dict['flip_y']):
+                            pred_dicts[idx]['pred_boxes'], _ = augmentor_utils.random_flip_along_y(pred_dicts[idx]['pred_boxes'], np.zeros((1,3)), enable=bool(enable))
+                if aug['NAME'] == 'random_world_rotation':
+                    if 'noise_rot' in batch_dict.keys():
+                        for idx, noise_rot in enumerate(batch_dict['noise_rot']):
+                            unrotated_boxes, _ = augmentor_utils.global_rotation(pred_dicts[idx]['pred_boxes'].cpu(), np.zeros((1,3)), [], return_rot=False, noise_rotation=-noise_rot.item())
+                            pred_dicts[idx]['pred_boxes'] = unrotated_boxes.cuda()
+                            
         annos = []
         for index, box_dict in enumerate(pred_dicts):
             single_pred_dict = generate_single_sample_dict(box_dict)
@@ -106,6 +134,44 @@ class DatasetTemplate(torch_data.Dataset):
             annos.append(single_pred_dict)
 
         return annos
+
+    def fill_pseudo_labels(self, input_dict, psid2clsid):
+        """
+        All labels are loaded with the index: class as 1:Vehicle, 2:Pedestrian.
+        Each target dataset.py should have a re-mapping in their __getitem__
+        """
+        
+        gt_boxes = self_training_utils.load_ps_label(input_dict['frame_id'])                
+        
+        class_of_interest = np.isin(gt_boxes[:, 7], list(psid2clsid.keys()))
+        gt_boxes = gt_boxes[class_of_interest]
+        gt_scores = gt_boxes[:, 8]
+        gt_classes = gt_boxes[:, 7]
+
+        remapped_classes = []
+        for cls_id in gt_classes:
+            if cls_id < 0:
+                remapped_id = -psid2clsid[abs(cls_id)]
+            else:
+                remapped_id = psid2clsid[cls_id]
+            remapped_classes.append(remapped_id)    
+        remapped_classes = np.array(remapped_classes)
+        gt_boxes = gt_boxes[:, :7]
+        gt_names = np.array(self.class_names)[np.abs(remapped_classes.astype(np.int32)) - 1]
+
+        input_dict['gt_boxes'] = gt_boxes
+        input_dict['gt_names'] = gt_names
+        input_dict['gt_classes'] = remapped_classes
+        input_dict['gt_scores'] = gt_scores
+        input_dict['pos_ps_bbox'] = np.zeros((len(self.class_names)), dtype=np.float32)
+        input_dict['ign_ps_bbox'] = np.zeros((len(self.class_names)), dtype=np.float32)
+        for i in range(len(self.class_names)):
+            num_total_boxes = (np.abs(remapped_classes) == (i+1)).sum()
+            num_ps_bbox = (remapped_classes == (i+1)).sum()
+            input_dict['pos_ps_bbox'][i] = num_ps_bbox
+            input_dict['ign_ps_bbox'][i] = num_total_boxes - num_ps_bbox
+        
+        input_dict.pop('num_points_in_gt', None)
 
     def merge_all_iters_to_one_epoch(self, merge=True, epochs=None):
         if merge:
@@ -131,30 +197,6 @@ class DatasetTemplate(torch_data.Dataset):
         """
         raise NotImplementedError
 
-    def set_lidar_aug_matrix(self, data_dict):
-        """
-            Get lidar augment matrix (4 x 4), which are used to recover orig point coordinates.
-        """
-        lidar_aug_matrix = np.eye(4)
-        if 'flip_y' in data_dict.keys():
-            flip_x = data_dict['flip_x']
-            flip_y = data_dict['flip_y']
-            if flip_x:
-                lidar_aug_matrix[:3,:3] = np.array([[1, 0, 0], [0, -1, 0], [0, 0, 1]]) @ lidar_aug_matrix[:3,:3]
-            if flip_y:
-                lidar_aug_matrix[:3,:3] = np.array([[-1, 0, 0], [0, 1, 0], [0, 0, 1]]) @ lidar_aug_matrix[:3,:3]
-        if 'noise_rot' in data_dict.keys():
-            noise_rot = data_dict['noise_rot']
-            lidar_aug_matrix[:3,:3] = common_utils.angle2matrix(torch.tensor(noise_rot)) @ lidar_aug_matrix[:3,:3]
-        if 'noise_scale' in data_dict.keys():
-            noise_scale = data_dict['noise_scale']
-            lidar_aug_matrix[:3,:3] *= noise_scale
-        if 'noise_translate' in data_dict.keys():
-            noise_translate = data_dict['noise_translate']
-            lidar_aug_matrix[:3,3:4] = noise_translate.T
-        data_dict['lidar_aug_matrix'] = lidar_aug_matrix
-        return data_dict
-
     def prepare_data(self, data_dict):
         """
         Args:
@@ -177,6 +219,20 @@ class DatasetTemplate(torch_data.Dataset):
                 ...
         """
         if self.training:
+            # filter gt_boxes without points
+            num_points_in_gt = data_dict.get('num_points_in_gt', None)
+            if num_points_in_gt is None:
+                num_points_in_gt = roiaware_pool3d_utils.points_in_boxes_cpu(
+                    torch.from_numpy(data_dict['points'][:, :3]),
+                    torch.from_numpy(data_dict['gt_boxes'][:, :7])).numpy().sum(axis=1)
+
+            mask = (num_points_in_gt >= self.dataset_cfg.get('MIN_POINTS_OF_GT', 1))
+            data_dict['gt_boxes'] = data_dict['gt_boxes'][mask]
+            data_dict['gt_names'] = data_dict['gt_names'][mask]
+            if 'gt_classes' in data_dict:
+                data_dict['gt_classes'] = data_dict['gt_classes'][mask]
+                data_dict['gt_scores'] = data_dict['gt_scores'][mask]
+
             assert 'gt_boxes' in data_dict, 'gt_boxes should be provided for training'
             gt_boxes_mask = np.array([n in self.class_names for n in data_dict['gt_names']], dtype=np.bool_)
             
@@ -190,12 +246,23 @@ class DatasetTemplate(torch_data.Dataset):
             )
             if 'calib' in data_dict:
                 data_dict['calib'] = calib
-        data_dict = self.set_lidar_aug_matrix(data_dict)
+
+        if not self.training and self.dataset_cfg.get('USE_TTA', False):            
+            data_dict = self.data_augmentor.forward(
+                data_dict={
+                    **data_dict,
+                }
+            )
         if data_dict.get('gt_boxes', None) is not None:
             selected = common_utils.keep_arrays_by_name(data_dict['gt_names'], self.class_names)
             data_dict['gt_boxes'] = data_dict['gt_boxes'][selected]
             data_dict['gt_names'] = data_dict['gt_names'][selected]
-            gt_classes = np.array([self.class_names.index(n) + 1 for n in data_dict['gt_names']], dtype=np.int32)
+             # for pseudo label has ignore labels.
+            if 'gt_classes' not in data_dict:
+                gt_classes = np.array([self.class_names.index(n) + 1 for n in data_dict['gt_names']], dtype=np.int32)
+            else:
+                gt_classes = data_dict['gt_classes'][selected]
+                data_dict['gt_scores'] = data_dict['gt_scores'][selected]
             gt_boxes = np.concatenate((data_dict['gt_boxes'], gt_classes.reshape(-1, 1).astype(np.float32)), axis=1)
             data_dict['gt_boxes'] = gt_boxes
 
@@ -210,12 +277,23 @@ class DatasetTemplate(torch_data.Dataset):
         )
 
         if self.training and len(data_dict['gt_boxes']) == 0:
-            new_index = np.random.randint(self.__len__())
-            return self.__getitem__(new_index)
+            if not self.dataset_cfg.get('ALLOW_EMPTY_GT_BOXES', False):
+                # If gt boxes are constantly empty, this will end up looping endlessly, leading to large CPU RAM consumption!
+                new_index = np.random.randint(self.__len__())
+                return self.__getitem__(new_index)
 
         data_dict.pop('gt_names', None)
+        data_dict.pop('gt_classes', None)
 
         return data_dict
+
+    def eval(self):
+        self.training = False
+        self.data_processor.eval()
+
+    def train(self):
+        self.training = True
+        self.data_processor.train()        
 
     @staticmethod
     def collate_batch(batch_list, _unused=False):
@@ -225,19 +303,13 @@ class DatasetTemplate(torch_data.Dataset):
                 data_dict[key].append(val)
         batch_size = len(batch_list)
         ret = {}
-        batch_size_ratio = 1
 
         for key, val in data_dict.items():
             try:
                 if key in ['voxels', 'voxel_num_points']:
-                    if isinstance(val[0], list):
-                        batch_size_ratio = len(val[0])
-                        val = [i for item in val for i in item]
                     ret[key] = np.concatenate(val, axis=0)
                 elif key in ['points', 'voxel_coords']:
                     coors = []
-                    if isinstance(val[0], list):
-                        val =  [i for item in val for i in item]
                     for i, coor in enumerate(val):
                         coor_pad = np.pad(coor, ((0, 0), (1, 0)), mode='constant', constant_values=i)
                         coors.append(coor_pad)
@@ -313,13 +385,17 @@ class DatasetTemplate(torch_data.Dataset):
                                 constant_values=pad_value)
                         points.append(points_pad)
                     ret[key] = np.stack(points, axis=0)
-                elif key in ['camera_imgs']:
-                    ret[key] = torch.stack([torch.stack(imgs,dim=0) for imgs in val],dim=0)
+                elif key in ['gt_scores']:
+                    max_gt = max([len(x) for x in val])
+                    batch_scores = np.zeros((batch_size, max_gt), dtype=np.float32)
+                    for k in range(batch_size):
+                        batch_scores[k, :val[k].__len__()] = val[k]
+                    ret[key] = batch_scores
                 else:
                     ret[key] = np.stack(val, axis=0)
             except:
                 print('Error in collate_batch: key=%s' % key)
                 raise TypeError
 
-        ret['batch_size'] = batch_size * batch_size_ratio
+        ret['batch_size'] = batch_size
         return ret

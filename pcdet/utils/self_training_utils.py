@@ -5,7 +5,6 @@ from tqdm import tqdm
 import numpy as np
 import torch.distributed as dist
 from pcdet.config import cfg
-from pcdet.models import load_data_to_gpu
 from pcdet.utils import common_utils, commu_utils, memory_ensemble_utils
 import pickle as pkl
 import re
@@ -55,6 +54,9 @@ def save_pseudo_label_epoch(model, val_loader, rank, leave_pbar, ps_label_dir, c
         ps_label_dir: dir to save pseudo label
         cur_epoch
     """
+    # Delayed import to avoid circular dependency during model package initialization.
+    from pcdet.models import load_data_to_gpu
+
     val_dataloader_iter = iter(val_loader)
     total_it_each_epoch = len(val_loader)
 

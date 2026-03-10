@@ -21,7 +21,7 @@ Use the following syntax to convert your `.pcd` data into `.npy` format:
 Bash
 
 ```
-python convert_pcd_to_npy.py --source_dir <input_folder> --target_dir <output_folder>
+python scripts/convert_pcd_to_npy.py --source_dir <input_folder> --target_dir <output_folder>
 ```
 
 _Example:_
@@ -29,7 +29,7 @@ _Example:_
 Bash
 
 ```
-python convert_pcd_to_npy.py --source_dir data/custom/location2 --target_dir data/custom/points_location2
+python scripts/convert_pcd_to_npy.py --source_dir data/custom/location2 --target_dir data/custom/points_location2
 ```
 
 ---

@@ -371,11 +371,14 @@ def get_initial_pseudo_labels(detection_sets, cls_kbf_config):
                                  frame_boxes['box_weights'][...,np.newaxis]])
 
         ps_label_nms = []
+        frame_names = np.asarray(frame_boxes['names'])
         for class_name in SUPERCATEGORIES:
-            cls_mask = (frame_boxes['names'] == class_name)
+            cls_mask = (frame_names == class_name)
             cls_boxes = boxes_lidar[cls_mask]
+            if cls_boxes.size == 0 or cls_boxes.shape[0] == 0:
+                continue
             cls_boxes = cls_boxes[cls_boxes[:,9] > 0] # Discard if box weight == 0
-            if cls_boxes.shape[0] == 0:
+            if cls_boxes.size == 0 or cls_boxes.shape[0] == 0:
                 continue
             score_mask = cls_boxes[:,8] > cls_kbf_config[class_name]['neg_th']
             cls_kbf_boxes = label_fusion(cls_boxes[score_mask],

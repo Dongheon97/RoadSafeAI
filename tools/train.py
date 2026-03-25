@@ -10,6 +10,8 @@ import torch
 import torch.nn as nn
 from tensorboardX import SummaryWriter
 
+from wandb_utils import MultiScalarLogger, finish_wandb, init_wandb_if_available
+
 from pcdet.config import cfg, cfg_from_list, cfg_from_yaml_file, log_config_to_file
 from pcdet.datasets import build_dataloader
 from pcdet.models import build_network, model_fn_decorator
@@ -114,7 +116,9 @@ def main():
     if cfg.LOCAL_RANK == 0:
         os.system('cp %s %s' % (args.cfg_file, output_dir))
 
-    tb_log = SummaryWriter(log_dir=str(output_dir / 'tensorboard')) if cfg.LOCAL_RANK == 0 else None
+    wandb_run = init_wandb_if_available(args, cfg, output_dir, logger=logger, job_type='train') if cfg.LOCAL_RANK == 0 else None
+    tb_writer = SummaryWriter(log_dir=str(output_dir / 'tensorboard')) if cfg.LOCAL_RANK == 0 else None
+    tb_log = MultiScalarLogger(tb_writer, wandb_run) if cfg.LOCAL_RANK == 0 else None
 
     # -----------------------create dataloader & network & optimizer---------------------------
     source_set, source_loader, source_sampler = build_dataloader(
@@ -258,6 +262,10 @@ def main():
     )
     logger.info('**********************End evaluation %s/%s(%s)**********************' %
                 (cfg.EXP_GROUP_PATH, cfg.TAG, args.extra_tag))
+
+    if tb_log is not None:
+        tb_log.close()
+    finish_wandb(logger=logger)
 
 
 if __name__ == '__main__':

@@ -118,7 +118,8 @@ class CustomDataset(DatasetTemplate):
         raise ValueError(f"Cannot infer point dimension for {lidar_path}")
 
     def get_sequence_data(self, info, points, sequence_name, sample_idx, max_sweeps):
-        points = self.remove_ego_points(points, center_radius=1.5)
+        ego_remove_radius = float(self.dataset_cfg.get("EGO_REMOVE_RADIUS", 1.5))
+        points = self.remove_ego_points(points, center_radius=ego_remove_radius)
         points = np.hstack([points, np.zeros((points.shape[0], 1), dtype=points.dtype)])  # + timestamp
 
         if max_sweeps <= 1:
@@ -136,7 +137,7 @@ class CustomDataset(DatasetTemplate):
             if prev_info is None:
                 continue
             points_pre = self.get_lidar(prev_info["lidar_path"])
-            points_pre = self.remove_ego_points(points_pre, center_radius=1.5)
+            points_pre = self.remove_ego_points(points_pre, center_radius=ego_remove_radius)
 
             pose_pre = np.asarray(prev_info["pose"], dtype=np.float32).reshape(4, 4)
             expand_points_pre = np.concatenate([points_pre[:, :3], np.ones((points_pre.shape[0], 1), dtype=np.float32)], axis=1)
@@ -218,4 +219,3 @@ class CustomDataset(DatasetTemplate):
                 self.logger.info("Skipping evaluation - no gt annotations provided.")
             return None, {}
         raise NotImplementedError
-

@@ -213,3 +213,5 @@ output/
 tools/custom_dataset_bev.png
 tools/cfgs/target_custom/label_generation/round*/ps_labels/
 tools/output/
+docs/
+AGENTS.md

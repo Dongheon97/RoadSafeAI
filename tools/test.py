@@ -11,6 +11,8 @@ import numpy as np
 import torch
 from tensorboardX import SummaryWriter
 
+from wandb_utils import MultiScalarLogger, get_active_wandb_run, init_wandb_if_available, finish_wandb
+
 from eval_utils import eval_utils
 from pcdet.config import cfg, cfg_from_list, cfg_from_yaml_file, log_config_to_file
 from pcdet.datasets import build_dataloader
@@ -72,7 +74,7 @@ def eval_single_ckpt(model, test_loader, args, eval_output_dir, logger, epoch_id
     model.cuda()
     
     # start evaluation
-    eval_utils.eval_one_epoch(
+    return eval_utils.eval_one_epoch(
         cfg, args, model, test_loader, epoch_id, logger, dist_test=dist_test,
         result_dir=eval_output_dir
     )
@@ -103,9 +105,12 @@ def repeat_eval_ckpt(model, test_loader, args, eval_output_dir, logger, ckpt_dir
     with open(ckpt_record_file, 'a'):
         pass
 
-    # tensorboard log
+    # tensorboard + optional wandb log
+    tb_log = None
     if cfg.LOCAL_RANK == 0:
-        tb_log = SummaryWriter(log_dir=str(eval_output_dir / ('tensorboard_%s' % cfg.DATA_CONFIG.DATA_SPLIT['test'])))
+        tb_writer = SummaryWriter(log_dir=str(eval_output_dir / ('tensorboard_%s' % cfg.DATA_CONFIG.DATA_SPLIT['test'])))
+        wandb_run = get_active_wandb_run() or init_wandb_if_available(args, cfg, eval_output_dir, logger=logger, job_type='eval')
+        tb_log = MultiScalarLogger(tb_writer, wandb_run)
     total_time = 0
     first_eval = True
 
@@ -136,7 +141,7 @@ def repeat_eval_ckpt(model, test_loader, args, eval_output_dir, logger, ckpt_dir
             result_dir=cur_result_dir
         )
 
-        if cfg.LOCAL_RANK == 0:
+        if cfg.LOCAL_RANK == 0 and tb_log is not None:
             for key, val in tb_dict.items():
                 tb_log.add_scalar(key, val, cur_epoch_id)
 
@@ -222,7 +227,17 @@ def main():
         if args.eval_all:
             repeat_eval_ckpt(model, test_loader, args, eval_output_dir, logger, ckpt_dir, dist_test=dist_test)
         else:
-            eval_single_ckpt(model, test_loader, args, eval_output_dir, logger, epoch_id, dist_test=dist_test)
+            tb_dict = eval_single_ckpt(model, test_loader, args, eval_output_dir, logger, epoch_id, dist_test=dist_test)
+            if cfg.LOCAL_RANK == 0:
+                tb_writer = SummaryWriter(log_dir=str(eval_output_dir / ('tensorboard_%s' % cfg.DATA_CONFIG.DATA_SPLIT['test'])))
+                wandb_run = get_active_wandb_run() or init_wandb_if_available(args, cfg, eval_output_dir, logger=logger, job_type='eval')
+                metric_logger = MultiScalarLogger(tb_writer, wandb_run)
+                if tb_dict is not None:
+                    for key, val in tb_dict.items():
+                        metric_logger.add_scalar(key, val, int(epoch_id) if str(epoch_id).isdigit() else None)
+                metric_logger.close()
+                if get_active_wandb_run() is not None and os.getenv('WANDB_FINISH_ON_TEST', '0') == '1':
+                    finish_wandb(logger=logger)
 
 
 if __name__ == '__main__':

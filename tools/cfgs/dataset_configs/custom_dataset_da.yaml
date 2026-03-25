@@ -2,9 +2,10 @@ DATASET: 'CustomDataset'
 DATA_PATH: '../data/custom_dataset'
 
 # Update this based on LiDAR mount height and coordinate convention.
-SHIFT_COOR: [0.0, 0.0, 0.0]
+SHIFT_COOR: [0.0, 0.0, 3.0]
 POINT_CLOUD_RANGE: [-75.2, -75.2, -3.0, 75.2, 75.2, 5.0]
 MAX_SWEEPS: 1
+EGO_REMOVE_RADIUS: 1.5
 ALLOW_EMPTY_GT_BOXES: True
 
 DATA_SPLIT: {

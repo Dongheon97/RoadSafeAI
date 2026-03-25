@@ -10,6 +10,7 @@ import open3d as o3d
 from visual_utils import open3d_vis_utils as V
 import argparse
 import pickle
+import os
 from pcdet.config import cfg, cfg_from_yaml_file
 from pcdet.utils import box_fusion_utils
 from pcdet.utils import compatibility_utils as compat
@@ -55,6 +56,10 @@ def main():
     parser.add_argument('--use_linemesh', action='store_true', default=False, help='Visualize with larger boxes but very slow render time')
     parser.add_argument('--use_class_colors', action='store_true', default=False)    
     parser.add_argument('--pointcloud_only', action='store_true', default=False)    
+    parser.add_argument('--interactive_step', action='store_true', default=False,
+                        help='Interactive detection viewer. Press Space for next frame, Q to quit.')
+    parser.add_argument('--pred_score_th', type=float, default=0.05,
+                        help='Prediction score threshold for displaying boxes in interactive_step mode.')
     args = parser.parse_args()
     
     if args.bev_vis:
@@ -198,6 +203,113 @@ def main():
         model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=True)
         model.cuda()
         model.eval()
+
+        if args.interactive_step:
+            start_idx = max(0, min(args.idx, len(target_set) - 1))
+            state = {'idx': start_idx}
+            model_class_names = list(cfg.CLASS_NAMES) if hasattr(cfg, 'CLASS_NAMES') else list(cls_names)
+
+            def summarize_class_counts(label_tensor):
+                if label_tensor is None or label_tensor.numel() == 0:
+                    return 'none'
+                labels = label_tensor.detach().cpu().numpy().astype(np.int32)
+                class_counts = {}
+                for label_id in labels:
+                    class_idx = int(label_id) - 1
+                    if 0 <= class_idx < len(model_class_names):
+                        class_name = model_class_names[class_idx]
+                    else:
+                        class_name = f'id_{int(label_id)}'
+                    class_counts[class_name] = class_counts.get(class_name, 0) + 1
+                return ', '.join([f'{k}:{v}' for k, v in sorted(class_counts.items())])
+
+            vis = o3d.visualization.VisualizerWithKeyCallback()
+            window_ok = vis.create_window(window_name='RoadSafeAI Detection Step Viewer')
+            if not window_ok:
+                display = os.environ.get('DISPLAY', '')
+                raise RuntimeError(
+                    'Open3D window creation failed. '
+                    f'DISPLAY="{display}". '
+                    'Run container with X11 forwarding (DISPLAY + /tmp/.X11-unix mount).'
+                )
+
+            def render_frame(vis_obj):
+                data_dict = target_set.collate_batch([target_set[state['idx']]])
+                load_data_to_gpu(data_dict)
+
+                with torch.no_grad():
+                    pred_dicts, _ = model.forward(data_dict)
+
+                pred_boxes = pred_dicts[0]['pred_boxes']
+                pred_labels = pred_dicts[0]['pred_labels']
+                pred_scores = pred_dicts[0]['pred_scores']
+
+                score_mask = pred_scores >= args.pred_score_th
+                shown_boxes = pred_boxes[score_mask]
+                shown_labels = pred_labels[score_mask]
+                shown_scores = pred_scores[score_mask]
+
+                gt_boxes = data_dict['gt_boxes'][0] if args.show_gt and 'gt_boxes' in data_dict else None
+                geom = V.get_geometries(
+                    points=data_dict['points'][:, 1:],
+                    gt_boxes=gt_boxes,
+                    ref_boxes=shown_boxes,
+                    ref_scores=shown_scores,
+                    ref_labels=shown_labels,
+                    use_linemesh=args.use_linemesh,
+                    use_class_colors=args.use_class_colors
+                )
+
+                vis_obj.clear_geometries()
+                for g in geom:
+                    vis_obj.add_geometry(g)
+
+                ctr = vis_obj.get_view_control()
+                if ctr is not None:
+                    ctr.set_front([ -0.009079385782427972, -0.79382993606647601, 0.60807203303433444 ])
+                    ctr.set_lookat([ 0.13592805125144847, 25.565951040207825, -13.855443454771956  ])
+                    ctr.set_up([-0.008889802784222859, 0.60813714531420293, 0.79378220180068892 ])
+                    ctr.set_zoom(0.21999999999999992)
+                render_opt = vis_obj.get_render_option()
+                if render_opt is not None:
+                    render_opt.point_size = 2.0
+                vis_obj.update_renderer()
+
+                frame_id = data_dict['frame_id'][0] if 'frame_id' in data_dict else str(state['idx'])
+                total_boxes = int(pred_scores.shape[0])
+                shown_count = int(score_mask.sum().item())
+                total_classes = summarize_class_counts(pred_labels)
+                shown_classes = summarize_class_counts(shown_labels)
+                print(
+                    f"[idx {state['idx']:04d}] frame_id={frame_id} "
+                    f"pred_total={total_boxes} shown(>={args.pred_score_th:.2f})={shown_count} "
+                    f"bbox_exists={shown_count > 0} "
+                    f"all_classes=[{total_classes}] shown_classes=[{shown_classes}]"
+                )
+
+            def on_space(vis_obj):
+                if state['idx'] >= len(target_set) - 1:
+                    print('Reached last frame.')
+                    return False
+                state['idx'] += 1
+                render_frame(vis_obj)
+                return False
+
+            def on_q(vis_obj):
+                vis_obj.close()
+                return False
+
+            vis.register_key_callback(ord(' '), on_space)
+            vis.register_key_callback(ord('Q'), on_q)
+            vis.register_key_callback(ord('N'), on_space)
+
+            print('Interactive mode: Space/N = next frame, Q = quit')
+            print(f"Starting from idx={state['idx']}, split={args.split}, score_th={args.pred_score_th:.2f}")
+            render_frame(vis)
+            vis.run()
+            vis.destroy_window()
+            return
+
         if args.save_video:
             vis = o3d.visualization.Visualizer()
             vis.create_window()

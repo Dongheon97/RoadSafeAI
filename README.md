@@ -90,3 +90,32 @@ python scripts/batch_inference.py \
     --ext .npy \
     --output_dir data/custom/labels_predicted
 ```
+
+
+## Mar. 24
+
+### Experiments & Evaluation
+**Goal:** Execute the first two control groups of the ablation study (Source-Only Baseline vs. Few-Shot Fine-tuning). Please ensure all commands are executed within the `~/RoadSafeAI/tools/` directory.
+
+**Experiment A: Source-Only Baseline**
+Directly evaluate the pre-trained KITTI model (which has never seen the construction site data) on our validation set.
+* **Expected Result:** Pedestrian AP will be close to 0% (due to the severe Sensor Domain Gap and viewpoint differences).
+* **Command:**
+```bash
+python test.py --cfg_file cfgs/custom_models/pv_rcnn.yaml --batch_size 1 --ckpt ../checkpoints/pv_rcnn_8369.pth
+```
+
+**Experiment B: Few-Shot Fine-tuning**
+Load the pre-trained weights and fine-tune the model for 80 epochs using our manually annotated 68-frame training set.
+* **Command:**
+```bash
+python train.py --cfg_file cfgs/custom_models/pv_rcnn.yaml --batch_size 2 --epochs 80 --pretrained_model ../checkpoints/pv_rcnn_8369.pth
+```
+
+**Experiment C: Few-Shot Evaluation**
+Use the newly fine-tuned weights from Experiment B to re-evaluate the 34-frame validation set.
+* **Expected Result:** A significant surge in AP (Recall@0.5 reaching over 80%), proving that few-shot fine-tuning can effectively adapt the model to our specific construction site scenario.
+* **Command:**
+```bash
+python test.py --cfg_file cfgs/custom_models/pv_rcnn.yaml --batch_size 1 --ckpt ../output/custom_models/pv_rcnn/default/ckpt/checkpoint_epoch_80.pth
+```

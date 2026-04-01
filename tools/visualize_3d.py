@@ -60,7 +60,33 @@ def main():
                         help='Interactive detection viewer. Press Space for next frame, Q to quit.')
     parser.add_argument('--pred_score_th', type=float, default=0.05,
                         help='Prediction score threshold for displaying boxes in interactive_step mode.')
+    parser.add_argument('--ps_score_th', type=float, default=0.4,
+                        help='Pseudo-label score threshold for displaying boxes from --ps_pkl.')
+    parser.add_argument('--theme', type=str, default='dark', choices=['dark', 'light'],
+                        help='Open3D viewer theme.')
+    parser.add_argument('--point_color_mode', type=str, default='height', choices=['height', 'mono'],
+                        help='Point cloud coloring mode.')
+    parser.add_argument('--point_size', type=float, default=2.0,
+                        help='Open3D point size for all viewer modes.')
+    parser.add_argument('--window_x', type=int, default=2000,
+                        help='Open3D window left position in pixels.')
+    parser.add_argument('--window_y', type=int, default=300,
+                        help='Open3D window top position in pixels.')
+    parser.add_argument('--window_width', type=int, default=4000,
+                        help='Open3D window width in pixels.')
+    parser.add_argument('--window_height', type=int, default=3000,
+                        help='Open3D window height in pixels.')
     args = parser.parse_args()
+
+    def apply_theme(vis_obj):
+        V.apply_render_theme(vis_obj, theme=args.theme, point_size=args.point_size)
+
+    geom_kwargs = {
+        'use_linemesh': args.use_linemesh,
+        'use_class_colors': args.use_class_colors,
+        'theme': args.theme,
+        'point_color_mode': args.point_color_mode,
+    }
     
     if args.bev_vis:
         from visualize_bev import plot_boxes
@@ -113,7 +139,12 @@ def main():
                 continue
             V.draw_scenes(points=data_dict['points'][:, 1:], 
                           gt_boxes=data_dict['gt_boxes'][0] if args.show_gt else None,                           
-                          draw_origin=False, use_linemesh=args.use_linemesh, ref_labels=list(data_dict['gt_boxes'][0][:,7].astype(int)))
+                          draw_origin=False, use_linemesh=args.use_linemesh,
+                          ref_labels=list(data_dict['gt_boxes'][0][:,7].astype(int)),
+                          window_x=args.window_x, window_y=args.window_y,
+                          window_width=args.window_width, window_height=args.window_height,
+                          theme=args.theme, point_color_mode=args.point_color_mode,
+                          point_size=args.point_size)
 
     # Visualize pkls
     if (args.det_pkl is not None) or (args.ps_pkl is not None) or (args.dets_txt is not None):    
@@ -122,31 +153,97 @@ def main():
         if args.det_pkl is not None:
             with open(args.det_pkl,'rb') as f:
                 det_annos = pickle.load(f)
+            valid_indices = [
+                idx for idx, det_anno in enumerate(det_annos)
+                if det_anno['frame_id'] in target_set.frameid_to_idx.keys()
+            ]
+            if not valid_indices:
+                print('No valid frames found in det_pkl for current dataset split.')
+                return
 
-            # eval_det_annos = copy.deepcopy(det_annos)   
-            for idx, det_anno in enumerate(det_annos):
-                if idx < args.idx:
-                    print(f'Skipping {idx}/{args.idx} out of {len(det_annos)} total samples')
-                    continue
+            start_pos = min(max(args.idx, 0), len(valid_indices) - 1)
+            state = {'pos': start_pos}
+
+            vis = o3d.visualization.VisualizerWithKeyCallback()
+            window_ok = vis.create_window(
+                window_name='RoadSafeAI PKL Step Viewer',
+                left=args.window_x,
+                top=args.window_y,
+                width=args.window_width,
+                height=args.window_height
+            )
+            if not window_ok:
+                display = os.environ.get('DISPLAY', '')
+                raise RuntimeError(
+                    'Open3D window creation failed. '
+                    f'DISPLAY="{display}". '
+                    'Run container with X11 forwarding (DISPLAY + /tmp/.X11-unix mount).'
+                )
+
+            def render_det_frame(vis_obj):
+                det_idx = valid_indices[state['pos']]
+                det_anno = det_annos[det_idx]
                 frame_id = det_anno['frame_id']
-                if frame_id not in target_set.frameid_to_idx.keys():
-                    print(f"{frame_id} not found in frameid_to_idx, skipping frame")
-                    continue
-                print(f'Visualizing frame idx: {idx}, frame_id: {frame_id}')
-                pts = target_set[target_set.frameid_to_idx[frame_id]]['points']
-                gt_boxes = target_set[target_set.frameid_to_idx[frame_id]]['gt_boxes']
-                # class_mask = np.isin(compat.get_gt_names(target_set, frame_id), ['Vehicle','car','truck','bus'])
+                sample = target_set[target_set.frameid_to_idx[frame_id]]
+                pts = sample['points']
+                gt_boxes = sample['gt_boxes']
+                score_mask = det_anno['score'] > 0.2
+                geom = V.get_geometries(
+                    points=pts,
+                    gt_boxes=gt_boxes if args.show_gt else None,
+                    ref_boxes=det_anno['boxes_lidar'][score_mask],
+                    ref_scores=det_anno['score'][score_mask],
+                    ref_labels=[1 for _ in range(int(score_mask.sum()))],
+                    **geom_kwargs
+                )
+                vis_obj.clear_geometries()
+                for g in geom:
+                    vis_obj.add_geometry(g)
+                ctr = vis_obj.get_view_control()
+                if ctr is not None:
+                    ctr.set_front([ -0.009079385782427972, -0.79382993606647601, 0.60807203303433444 ])
+                    ctr.set_lookat([ 0.13592805125144847, 25.565951040207825, -13.855443454771956  ])
+                    ctr.set_up([-0.008889802784222859, 0.60813714531420293, 0.79378220180068892 ])
+                    ctr.set_zoom(0.21999999999999992)
+                apply_theme(vis_obj)
+                vis_obj.update_renderer()
+                print(
+                    f"[det_pkl {state['pos']+1}/{len(valid_indices)}] "
+                    f"frame_idx={det_idx} frame_id={frame_id} shown_boxes={int(score_mask.sum())}"
+                )
 
-            # for idx, data_dict in enumerate(target_loader):
-            #     if idx < args.idx:
-            #         print(f'Skipping {idx}/{args.idx}')
-            #         continue
-                V.draw_scenes(points=pts, 
-                                ref_boxes=det_anno['boxes_lidar'][det_anno['score'] > 0.2],                         
-                                ref_scores=det_anno['score'][det_anno['score'] > 0.2], 
-                                ref_labels=[1 for i in range(len(det_anno['boxes_lidar'][det_anno['score'] > 0.2]))],
-                                gt_boxes=gt_boxes if args.show_gt else None, use_class_colors=args.use_class_colors,
-                                draw_origin=False, use_linemesh=args.use_linemesh)
+            def on_space(vis_obj):
+                if state['pos'] >= len(valid_indices) - 1:
+                    print('Reached last frame.')
+                    return False
+                state['pos'] += 1
+                render_det_frame(vis_obj)
+                return False
+
+            def on_prev(vis_obj):
+                if state['pos'] <= 0:
+                    print('Reached first frame.')
+                    return False
+                state['pos'] -= 1
+                render_det_frame(vis_obj)
+                return False
+
+            def on_q(vis_obj):
+                vis_obj.close()
+                return False
+
+            vis.register_key_callback(ord(' '), on_space)
+            vis.register_key_callback(ord('N'), on_space)
+            vis.register_key_callback(262, on_space)
+            vis.register_key_callback(ord('B'), on_prev)
+            vis.register_key_callback(263, on_prev)
+            vis.register_key_callback(ord('Q'), on_q)
+            vis.register_key_callback(256, on_q)
+            print('PKL mode: Space/N/Right = next, B/Left = previous, Q/Esc = quit')
+            render_det_frame(vis)
+            vis.run()
+            vis.destroy_window()
+            return
         if args.ps_pkl is not None:
             with open(args.ps_pkl,'rb') as f:
                 ps_dict = pickle.load(f)
@@ -154,48 +251,200 @@ def main():
             if args.ps_pkl2 is not None:
                 with open(args.ps_pkl2,'rb') as f:
                     ps_dict2 = pickle.load(f)
+            valid_indices = [
+                idx for idx in range(len(target_set))
+                if idx_to_frameid[idx] in ps_dict.keys()
+            ]
+            if not valid_indices:
+                print('No valid frames found in ps_pkl for current dataset split.')
+                return
 
-            for idx, data_dict in enumerate(target_loader):
-                if idx < args.idx:
-                    print(f'Skipping {idx}/{args.idx}')
-                    continue
+            start_pos = min(max(args.idx, 0), len(valid_indices) - 1)
+            state = {'pos': start_pos}
 
-                frame_id = idx_to_frameid[idx]
-                if frame_id not in ps_dict.keys():
-                    print(f"{frame_id} not in ps_dict, skipping frame")
-                    continue
-                # mask = ps_dict[frame_id]['gt_boxes'][:,8] > 0.4 #0.6 for ps_label, 0.4 for ps_dict_1f
-                print(f'Visualizing frame idx: {idx}, frame_id: {frame_id}')
-                V.draw_scenes(points=data_dict['points'][:, 1:], 
-                                ref_boxes=ps_dict[frame_id]['gt_boxes'][:,:7][ps_dict[frame_id]['gt_boxes'][:,8] > 0.4],
-                                ref_boxes2=ps_dict2[frame_id]['gt_boxes'][:,:7] if args.ps_pkl2 is not None else None,                         
-                                ref_scores=ps_dict[frame_id]['gt_boxes'][:,8][ps_dict[frame_id]['gt_boxes'][:,8] > 0.4], 
-                                ref_labels=list(abs(ps_dict[frame_id]['gt_boxes'][:,7][ps_dict[frame_id]['gt_boxes'][:,8] > 0.4].astype(int))),
-                                gt_boxes=data_dict['gt_boxes'][0] if args.show_gt else None, 
-                                draw_origin=False, use_linemesh=args.use_linemesh, use_class_colors=args.use_class_colors,)
+            vis = o3d.visualization.VisualizerWithKeyCallback()
+            window_ok = vis.create_window(
+                window_name='RoadSafeAI PKL Step Viewer',
+                left=args.window_x,
+                top=args.window_y,
+                width=args.window_width,
+                height=args.window_height
+            )
+            if not window_ok:
+                display = os.environ.get('DISPLAY', '')
+                raise RuntimeError(
+                    'Open3D window creation failed. '
+                    f'DISPLAY="{display}". '
+                    'Run container with X11 forwarding (DISPLAY + /tmp/.X11-unix mount).'
+                )
+
+            def render_ps_frame(vis_obj):
+                ds_idx = valid_indices[state['pos']]
+                sample = target_set[ds_idx]
+                frame_id = idx_to_frameid[ds_idx]
+                gt_boxes = sample['gt_boxes']
+                ps_mask = ps_dict[frame_id]['gt_boxes'][:,8] > args.ps_score_th
+                ref_boxes2 = ps_dict2[frame_id]['gt_boxes'][:,:7] if args.ps_pkl2 is not None else None
+                geom = V.get_geometries(
+                    points=sample['points'],
+                    gt_boxes=gt_boxes if args.show_gt else None,
+                    ref_boxes=ps_dict[frame_id]['gt_boxes'][:,:7][ps_mask],
+                    ref_boxes2=ref_boxes2,
+                    ref_scores=ps_dict[frame_id]['gt_boxes'][:,8][ps_mask],
+                    ref_labels=list(abs(ps_dict[frame_id]['gt_boxes'][:,7][ps_mask].astype(int))),
+                    **geom_kwargs
+                )
+                vis_obj.clear_geometries()
+                for g in geom:
+                    vis_obj.add_geometry(g)
+                ctr = vis_obj.get_view_control()
+                if ctr is not None:
+                    ctr.set_front([ -0.009079385782427972, -0.79382993606647601, 0.60807203303433444 ])
+                    ctr.set_lookat([ 0.13592805125144847, 25.565951040207825, -13.855443454771956  ])
+                    ctr.set_up([-0.008889802784222859, 0.60813714531420293, 0.79378220180068892 ])
+                    ctr.set_zoom(0.21999999999999992)
+                apply_theme(vis_obj)
+                vis_obj.update_renderer()
+                shown_boxes = int(ps_mask.sum())
+                print(
+                    f"[ps_pkl {state['pos']+1}/{len(valid_indices)}] "
+                    f"dataset_idx={ds_idx} frame_id={frame_id} shown_boxes={shown_boxes} "
+                    f"ps_score_th={args.ps_score_th:.2f}"
+                )
+
+            def on_space(vis_obj):
+                if state['pos'] >= len(valid_indices) - 1:
+                    print('Reached last frame.')
+                    return False
+                state['pos'] += 1
+                render_ps_frame(vis_obj)
+                return False
+
+            def on_prev(vis_obj):
+                if state['pos'] <= 0:
+                    print('Reached first frame.')
+                    return False
+                state['pos'] -= 1
+                render_ps_frame(vis_obj)
+                return False
+
+            def on_q(vis_obj):
+                vis_obj.close()
+                return False
+
+            vis.register_key_callback(ord(' '), on_space)
+            vis.register_key_callback(ord('N'), on_space)
+            vis.register_key_callback(262, on_space)
+            vis.register_key_callback(ord('B'), on_prev)
+            vis.register_key_callback(263, on_prev)
+            vis.register_key_callback(ord('Q'), on_q)
+            vis.register_key_callback(256, on_q)
+            print('PKL mode: Space/N/Right = next, B/Left = previous, Q/Esc = quit')
+            render_ps_frame(vis)
+            vis.run()
+            vis.destroy_window()
+            return
         else:                        
             det_annos = box_fusion_utils.load_src_paths_txt(args.dets_txt)
             src_keys = list(det_annos.keys())
             src_keys.remove('det_cls_weights')
             len_data = len(det_annos[src_keys[0]])
+            valid_indices = [
+                idx for idx in range(len_data)
+                if det_annos[src_keys[0]][idx]['frame_id'] in target_set.frameid_to_idx.keys()
+            ]
+            if not valid_indices:
+                print('No valid frames found in dets_txt for current dataset split.')
+                return
 
-            for idx in range(len_data):
-                if idx < args.idx:
-                    print(f'Skipping {idx}/{args.idx}')
-                    continue
-                frame_id = det_annos[src_keys[0]][idx]['frame_id']
-                if frame_id not in target_set.frameid_to_idx.keys():
-                    print(f"{frame_id} not found in frameid_to_idx, skipping frame")
-                    continue
-                print(f'Visualizing frame idx: {idx}, frame_id: {frame_id}')
-                pts = target_set[target_set.frameid_to_idx[frame_id]]['points']
-                gt_boxes = target_set[target_set.frameid_to_idx[frame_id]]['gt_boxes']        
-                
-                geom = V.draw_scenes_msda(points=pts, 
-                                          idx=idx,
-                                          det_annos=det_annos,                                        
-                                          gt_boxes=gt_boxes if args.show_gt else None,
-                                          use_linemesh=args.use_linemesh)
+            start_pos = min(max(args.idx, 0), len(valid_indices) - 1)
+            state = {'pos': start_pos}
+
+            vis = o3d.visualization.VisualizerWithKeyCallback()
+            window_ok = vis.create_window(
+                window_name='RoadSafeAI PKL Step Viewer',
+                left=args.window_x,
+                top=args.window_y,
+                width=args.window_width,
+                height=args.window_height
+            )
+            if not window_ok:
+                display = os.environ.get('DISPLAY', '')
+                raise RuntimeError(
+                    'Open3D window creation failed. '
+                    f'DISPLAY="{display}". '
+                    'Run container with X11 forwarding (DISPLAY + /tmp/.X11-unix mount).'
+                )
+
+            cmap = np.array([[49,131,106],[193, 107, 107],[110, 163, 167],[214, 206, 114],[49,131,106],[110, 163, 167],[214, 206, 114]])/255
+
+            def render_msda_frame(vis_obj):
+                det_idx = valid_indices[state['pos']]
+                frame_id = det_annos[src_keys[0]][det_idx]['frame_id']
+                sample = target_set[target_set.frameid_to_idx[frame_id]]
+                geom = []
+                for sid, key in enumerate(src_keys):
+                    points = sample['points'] if sid == 0 else None
+                    mask = det_annos[key][det_idx]['score'] > 0.2
+                    geom.extend(V.get_geometries(
+                        points=points,
+                        ref_boxes=det_annos[key][det_idx]['boxes_lidar'][mask],
+                        ref_scores=det_annos[key][det_idx]['score'][mask],
+                        ref_labels=[1 for _ in range(int(mask.sum()))],
+                        ref_box_colors=cmap[sid % len(cmap)],
+                        gt_boxes=sample['gt_boxes'] if args.show_gt else None,
+                        draw_origin=False,
+                        line_thickness=0.055,
+                        use_linemesh=args.use_linemesh,
+                        use_class_colors=args.use_class_colors,
+                        theme=args.theme,
+                        point_color_mode=args.point_color_mode
+                    ))
+                vis_obj.clear_geometries()
+                for g in geom:
+                    vis_obj.add_geometry(g)
+                ctr = vis_obj.get_view_control()
+                if ctr is not None:
+                    ctr.set_front([ 0.72737973442893356, -0.51797808311597837, 0.45013045592760198 ])
+                    ctr.set_lookat([ -13.773417658854088, 0.062465858514556709, -0.53706070047660459 ])
+                    ctr.set_up([ -0.37595030931731882, 0.2479623453125949, 0.89284715390221758 ])
+                    ctr.set_zoom(0.079999999999999946)
+                apply_theme(vis_obj)
+                vis_obj.update_renderer()
+                print(f"[dets_txt {state['pos']+1}/{len(valid_indices)}] frame_idx={det_idx} frame_id={frame_id}")
+
+            def on_space(vis_obj):
+                if state['pos'] >= len(valid_indices) - 1:
+                    print('Reached last frame.')
+                    return False
+                state['pos'] += 1
+                render_msda_frame(vis_obj)
+                return False
+
+            def on_prev(vis_obj):
+                if state['pos'] <= 0:
+                    print('Reached first frame.')
+                    return False
+                state['pos'] -= 1
+                render_msda_frame(vis_obj)
+                return False
+
+            def on_q(vis_obj):
+                vis_obj.close()
+                return False
+
+            vis.register_key_callback(ord(' '), on_space)
+            vis.register_key_callback(ord('N'), on_space)
+            vis.register_key_callback(262, on_space)
+            vis.register_key_callback(ord('B'), on_prev)
+            vis.register_key_callback(263, on_prev)
+            vis.register_key_callback(ord('Q'), on_q)
+            vis.register_key_callback(256, on_q)
+            print('PKL mode: Space/N/Right = next, B/Left = previous, Q/Esc = quit')
+            render_msda_frame(vis)
+            vis.run()
+            vis.destroy_window()
+            return
             
     else:
         # Load trained model for inference
@@ -224,7 +473,13 @@ def main():
                 return ', '.join([f'{k}:{v}' for k, v in sorted(class_counts.items())])
 
             vis = o3d.visualization.VisualizerWithKeyCallback()
-            window_ok = vis.create_window(window_name='RoadSafeAI Detection Step Viewer')
+            window_ok = vis.create_window(
+                window_name='RoadSafeAI Detection Step Viewer',
+                left=args.window_x,
+                top=args.window_y,
+                width=args.window_width,
+                height=args.window_height
+            )
             if not window_ok:
                 display = os.environ.get('DISPLAY', '')
                 raise RuntimeError(
@@ -256,8 +511,7 @@ def main():
                     ref_boxes=shown_boxes,
                     ref_scores=shown_scores,
                     ref_labels=shown_labels,
-                    use_linemesh=args.use_linemesh,
-                    use_class_colors=args.use_class_colors
+                    **geom_kwargs
                 )
 
                 vis_obj.clear_geometries()
@@ -270,9 +524,7 @@ def main():
                     ctr.set_lookat([ 0.13592805125144847, 25.565951040207825, -13.855443454771956  ])
                     ctr.set_up([-0.008889802784222859, 0.60813714531420293, 0.79378220180068892 ])
                     ctr.set_zoom(0.21999999999999992)
-                render_opt = vis_obj.get_render_option()
-                if render_opt is not None:
-                    render_opt.point_size = 2.0
+                apply_theme(vis_obj)
                 vis_obj.update_renderer()
 
                 frame_id = data_dict['frame_id'][0] if 'frame_id' in data_dict else str(state['idx'])
@@ -312,7 +564,13 @@ def main():
 
         if args.save_video:
             vis = o3d.visualization.Visualizer()
-            vis.create_window()
+            vis.create_window(
+                left=args.window_x,
+                top=args.window_y,
+                width=args.window_width,
+                height=args.window_height
+            )
+            apply_theme(vis)
         
         with torch.no_grad():
             for idx, data_dict in enumerate(target_loader):
@@ -340,11 +598,15 @@ def main():
                     
                     if args.pointcloud_only:
                         geom = V.get_geometries(
-                                    points=data_dict['points'][:, 1:])
+                                    points=data_dict['points'][:, 1:],
+                                    theme=args.theme,
+                                    point_color_mode=args.point_color_mode)
                     else:
                         geom = V.get_geometries(
                                 points=data_dict['points'][:, 1:], gt_boxes=gt_boxes if args.show_gt else None, ref_boxes=pred_dicts[0]['pred_boxes'], 
-                                ref_scores=pred_dicts[0]['pred_scores'], ref_labels=pred_dicts[0]['pred_labels'], use_linemesh=args.use_linemesh
+                                ref_scores=pred_dicts[0]['pred_scores'], ref_labels=pred_dicts[0]['pred_labels'],
+                                use_linemesh=args.use_linemesh, use_class_colors=args.use_class_colors,
+                                theme=args.theme, point_color_mode=args.point_color_mode
                             )
                         
                     vis.clear_geometries()
@@ -364,7 +626,7 @@ def main():
                     ctr.set_lookat([ 15.417785290867977, -1.6179187751048014, -8.5173845851153143 ])
                     ctr.set_up([0.60625059182523544, -0.020154889264250107, 0.79501823900480273])
                     ctr.set_zoom(0.17999999999999994)
-                    vis.get_render_option().point_size = 1.0       
+                    apply_theme(vis)
 
                     # MS3D++ tgt_lyft qualitative
                     # ctr.set_front([  0.79570141514638959, -0.092133463771410615, 0.59864069589989899 ])
@@ -430,7 +692,12 @@ def main():
                     else:
                         V.draw_scenes(
                             points=data_dict['points'][:, 1:], gt_boxes=gt_boxes if args.show_gt else None, ref_boxes=ref_boxes, 
-                            ref_scores=ref_scores, ref_labels=ref_labels, use_linemesh=args.use_linemesh, use_class_colors=args.use_class_colors
+                            ref_scores=ref_scores, ref_labels=ref_labels, use_linemesh=args.use_linemesh,
+                            use_class_colors=args.use_class_colors,
+                            window_x=args.window_x, window_y=args.window_y,
+                            window_width=args.window_width, window_height=args.window_height,
+                            theme=args.theme, point_color_mode=args.point_color_mode,
+                            point_size=args.point_size
                         )
 
 

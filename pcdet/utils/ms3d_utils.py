@@ -203,7 +203,7 @@ def select_ps_by_th(ps_dict, pos_th):
                                 ps_dict[frame_id]['gt_boxes'][:,8] < pos_th[1])
         ps_dict[frame_id]['gt_boxes'][:,7][ped_mask] = -abs(ps_dict[frame_id]['gt_boxes'][:,7][ped_mask])
 
-        cyc_mask = np.logical_and(abs(ps_dict[frame_id]['gt_boxes'][:,7]) == 2, 
+        cyc_mask = np.logical_and(abs(ps_dict[frame_id]['gt_boxes'][:,7]) == 3, 
                                 ps_dict[frame_id]['gt_boxes'][:,8] < pos_th[2])
         ps_dict[frame_id]['gt_boxes'][:,7][cyc_mask] = -abs(ps_dict[frame_id]['gt_boxes'][:,7][cyc_mask])
 
@@ -502,4 +502,3 @@ def load_dataset(cfg, split):
                 batch_size=1, logger=logger, training=False, dist=False, workers=1
             )      
     return target_set
-

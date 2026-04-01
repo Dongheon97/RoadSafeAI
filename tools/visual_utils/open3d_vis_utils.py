@@ -26,6 +26,86 @@ box_colormap = [
     [0.6       , 0.6       , 0.6       ]
 ]
 
+dark_box_colormap = [
+    [1.0, 1.0, 1.0],          # ignore
+    [0.36, 0.75, 1.0],        # car
+    [1.0, 0.48, 0.78],        # ped
+    [0.18, 0.95, 0.92],
+    [0.58, 0.84, 1.0],
+    [1.0, 0.50, 0.40],
+    [1.0, 0.48, 0.78],
+    [1.0, 0.70, 0.24],
+    [1.0, 0.95, 0.36],
+    [0.78, 0.57, 0.36],
+    [1.0, 0.68, 0.86],
+    [0.78, 0.82, 0.88]
+]
+
+THEME_CONFIGS = {
+    'dark': {
+        'background_color': np.array([0.035, 0.035, 0.045]),
+        'point_mono_color': np.array([0.86, 0.89, 0.93]),
+        'point_colormap': 'plasma',
+        'pred_box_color': np.array([0.16, 0.95, 0.84]),
+        'ref_box2_color': np.array([1.0, 0.46, 0.24]),
+        'gt_box_color': np.array([1.0, 0.82, 0.32]),
+        'class_box_colormap': dark_box_colormap,
+        'point_brightness_floor': 0.18,
+    },
+    'light': {
+        'background_color': np.array([1.0, 1.0, 1.0]),
+        'point_mono_color': np.array([0.72, 0.72, 0.72]),
+        'point_colormap': 'viridis',
+        'pred_box_color': np.array([0.19215686, 0.59215686, 0.41568627]),
+        'ref_box2_color': np.array([0.79215686, 0.19215686, 0.21568627]),
+        'gt_box_color': np.array([0.0, 0.0, 1.0]),
+        'class_box_colormap': box_colormap,
+        'point_brightness_floor': 0.0,
+    },
+}
+
+
+def get_theme_config(theme='dark'):
+    return THEME_CONFIGS.get(theme, THEME_CONFIGS['dark'])
+
+
+def apply_render_theme(vis, theme='dark', point_size=2.0):
+    render_opt = vis.get_render_option()
+    if render_opt is None:
+        return
+    theme_cfg = get_theme_config(theme)
+    render_opt.background_color = theme_cfg['background_color']
+    render_opt.point_size = point_size
+    if hasattr(render_opt, 'line_width'):
+        render_opt.line_width = 2.0
+
+
+def get_point_colors(points, point_color_mode='height', theme='dark'):
+    theme_cfg = get_theme_config(theme)
+    num_points = points.shape[0]
+    if num_points == 0:
+        return np.empty((0, 3))
+
+    if point_color_mode == 'mono':
+        return np.tile(theme_cfg['point_mono_color'], (num_points, 1))
+
+    z_values = points[:, 2]
+    lower, upper = np.percentile(z_values, [2, 98])
+    if np.isclose(lower, upper):
+        lower = float(np.min(z_values))
+        upper = float(np.max(z_values))
+
+    if np.isclose(lower, upper):
+        return np.tile(theme_cfg['point_mono_color'], (num_points, 1))
+
+    z_norm = np.clip((z_values - lower) / (upper - lower), 0.0, 1.0)
+    cmap = plt.get_cmap(theme_cfg['point_colormap'])
+    colors = cmap(z_norm)[:, :3]
+    floor = theme_cfg['point_brightness_floor']
+    if floor > 0.0:
+        colors = floor + (1.0 - floor) * colors
+    return np.clip(colors, 0.0, 1.0)
+
 
 def get_coor_colors(obj_labels):
     """
@@ -45,10 +125,24 @@ def get_coor_colors(obj_labels):
 
     return label_rgba
 
-def draw_scenes_msda(points, idx, gt_boxes, det_annos, draw_origin=False, min_score=0.2, use_linemesh=False):
+def _run_blocking_window(vis):
+    def _close_window(vis_obj):
+        vis_obj.close()
+        return False
 
-    vis = open3d.visualization.Visualizer()
-    vis.create_window()
+    for key in (32, ord('N'), ord('Q'), 256):
+        vis.register_key_callback(key, _close_window)
+
+    vis.run()
+    vis.destroy_window()
+
+
+def draw_scenes_msda(points, idx, gt_boxes, det_annos, draw_origin=False, min_score=0.2, use_linemesh=False,
+                     window_x=50, window_y=50, window_width=1600, window_height=960,
+                     theme='dark', point_color_mode='height', point_size=2.0):
+
+    vis = open3d.visualization.VisualizerWithKeyCallback()
+    vis.create_window(left=window_x, top=window_y, width=window_width, height=window_height)
 
     
 
@@ -67,8 +161,10 @@ def draw_scenes_msda(points, idx, gt_boxes, det_annos, draw_origin=False, min_sc
                                 ref_box_colors=cmap[sid % len(cmap)],
                                 gt_boxes=gt_boxes, 
                                 draw_origin=draw_origin, 
-                                line_thickness=0.04,
-                                use_linemesh=use_linemesh)
+                                line_thickness=0.055,
+                                use_linemesh=use_linemesh,
+                                theme=theme,
+                                point_color_mode=point_color_mode)
         for g in geom:                
             vis.add_geometry(g)
 
@@ -90,21 +186,23 @@ def draw_scenes_msda(points, idx, gt_boxes, det_annos, draw_origin=False, min_sc
     ctr.set_up([ -0.37595030931731882, 0.2479623453125949, 0.89284715390221758 ])
     ctr.set_zoom(0.079999999999999946)
 
-    vis.get_render_option().point_size = 1.0
-    vis.run()
-    vis.destroy_window()
+    apply_render_theme(vis, theme=theme, point_size=point_size)
+    _run_blocking_window(vis)
 
 def draw_scenes(points=None, gt_boxes=None, ref_boxes=None, ref_boxes2=None, ref_labels=None, ref_scores=None, ref_box_colors=None, 
-                point_colors=None, draw_origin=False, use_linemesh=False,use_class_colors=True):
+                point_colors=None, draw_origin=False, use_linemesh=False,use_class_colors=True,
+                window_x=50, window_y=50, window_width=1600, window_height=960,
+                theme='dark', point_color_mode='height', point_size=2.0):
 
-    vis = open3d.visualization.Visualizer()
-    vis.create_window()
+    vis = open3d.visualization.VisualizerWithKeyCallback()
+    vis.create_window(left=window_x, top=window_y, width=window_width, height=window_height)
 
     geom = get_geometries(points, gt_boxes=gt_boxes, 
                           ref_boxes=ref_boxes, ref_boxes2=ref_boxes2, ref_labels=ref_labels, 
                           ref_scores=ref_scores, ref_box_colors=ref_box_colors, use_class_colors=use_class_colors,
                           point_colors=point_colors, draw_origin=draw_origin,
-                          line_thickness=0.06, use_linemesh=use_linemesh)
+                          line_thickness=0.075, use_linemesh=use_linemesh,
+                          theme=theme, point_color_mode=point_color_mode)
     vis.clear_geometries()
     for g in geom:                
         vis.add_geometry(g)
@@ -117,7 +215,7 @@ def draw_scenes(points=None, gt_boxes=None, ref_boxes=None, ref_boxes2=None, ref
     ctr.set_lookat([ 0.13592805125144847, 25.565951040207825, -13.855443454771956  ])
     ctr.set_up([-0.008889802784222859, 0.60813714531420293, 0.79378220180068892 ])
     ctr.set_zoom(0.21999999999999992)
-    vis.get_render_option().point_size = 2.0    
+    apply_render_theme(vis, theme=theme, point_size=point_size)
 
     # Original, zoom in, ego vehicle moving towards
     # ctr.set_front([ 0.59083558928204927, 0.44198102848405585, 0.6749563518464804 ])
@@ -132,20 +230,25 @@ def draw_scenes(points=None, gt_boxes=None, ref_boxes=None, ref_boxes2=None, ref
     # ctr.set_zoom(0.21900000000000003)
 
     
-    vis.run()
-    vis.destroy_window()
+    _run_blocking_window(vis)
 
 def get_geometries(points, gt_boxes=None, ref_boxes=None, ref_labels=None, ref_boxes2=None, 
                    ref_scores=None, ref_box_colors=None, point_colors=None, use_class_colors=True,
-                   draw_origin=False, line_thickness=0.06, use_linemesh=False):
+                   draw_origin=False, line_thickness=0.075, use_linemesh=False,
+                   theme='dark', point_color_mode='height'):
     if isinstance(points, torch.Tensor):
         points = points.cpu().numpy()
     if isinstance(gt_boxes, torch.Tensor):
         gt_boxes = gt_boxes.cpu().numpy()
     if isinstance(ref_boxes, torch.Tensor):
         ref_boxes = ref_boxes.cpu().numpy()
+    if isinstance(ref_boxes2, torch.Tensor):
+        ref_boxes2 = ref_boxes2.cpu().numpy()
+    if isinstance(point_colors, torch.Tensor):
+        point_colors = point_colors.cpu().numpy()
 
     geometries = []
+    theme_cfg = get_theme_config(theme)
 
     if draw_origin:
         axis_pcd = open3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0, origin=[0, 0, 0])
@@ -154,39 +257,44 @@ def get_geometries(points, gt_boxes=None, ref_boxes=None, ref_labels=None, ref_b
     if points is not None:
         pts = open3d.geometry.PointCloud()
         pts.points = open3d.utility.Vector3dVector(points[:, :3])
-        # pts.paint_uniform_color(np.array([0.14, 0.34, 0.69]))
-        pts.paint_uniform_color(np.array([0.72,0.72,0.72]))
+        if point_colors is not None:
+            colors = np.asarray(point_colors)
+        else:
+            colors = get_point_colors(points[:, :3], point_color_mode=point_color_mode, theme=theme)
+        pts.colors = open3d.utility.Vector3dVector(colors)
         geometries.append(pts)
 
     if gt_boxes is not None:
         # if nuscenes, gt_boxes class is gt_boxes[:,9] or [:,-1] for setting colors
         # for waymo, gt_boxes class is gt_boxes[:,7]. Not sure if it's also -1 so this might throw an error
-        box = get_box(gt_boxes, (0, 0, 1.0), ref_labels=list(gt_boxes[:,-1].astype(int)), use_linemesh=use_linemesh, use_class_colors=use_class_colors)
+        box = get_box(
+            gt_boxes,
+            theme_cfg['gt_box_color'],
+            ref_labels=list(gt_boxes[:,-1].astype(int)),
+            use_linemesh=use_linemesh,
+            use_class_colors=use_class_colors,
+            theme=theme
+        )
         geometries.extend(box)
 
     if ref_boxes is not None:
-        # color = ref_box_colors if ref_box_colors is not None else (0,0.6,0)
-        # color = ref_box_colors if ref_box_colors is not None else (0.255,0.518,0.89)
-        color = ref_box_colors if ref_box_colors is not None else (0.19215686, 0.59215686, 0.41568627) # original pred green
-        # color = ref_box_colors if ref_box_colors is not None else (0.43137255, 0.63921569, 0.65490196)
-        
-        box = get_box(ref_boxes, color, line_thickness=line_thickness, use_linemesh=use_linemesh)
+        color = ref_box_colors if ref_box_colors is not None else theme_cfg['pred_box_color']
+        box = get_box(ref_boxes, color, line_thickness=line_thickness, use_linemesh=use_linemesh, theme=theme)
         geometries.extend(box)
 
     if ref_boxes2 is not None:
-        # color = ref_box_colors if ref_box_colors is not None else (0,0.6,0)
-        # color = ref_box_colors if ref_box_colors is not None else (0.255,0.518,0.89)
-        color = ref_box_colors if ref_box_colors is not None else (0.79215686, 0.19215686, 0.21568627)
-        box = get_box(ref_boxes2, color, line_thickness=line_thickness, use_linemesh=use_linemesh)
+        color = ref_box_colors if ref_box_colors is not None else theme_cfg['ref_box2_color']
+        box = get_box(ref_boxes2, color, line_thickness=line_thickness, use_linemesh=use_linemesh, theme=theme)
         geometries.extend(box)
 
     return geometries
 
-def get_box(boxes, color=(0, 1, 0), ref_labels=None, score=None, line_thickness=0.06, use_linemesh=True, use_class_colors=True): #0.02
+def get_box(boxes, color=(0, 1, 0), ref_labels=None, score=None, line_thickness=0.075, use_linemesh=True, use_class_colors=True, theme='dark'): #0.02
     """
     Linemesh gives much thicker box lines but is extremely slow. Use only if you don't need to change viewpoint
     """
     ret_boxes = []
+    theme_cfg = get_theme_config(theme)
         
     # cmap = np.array([[49,131,106],[176,73,73],[160,155,30],[25,97,120],[0,0,0],[120,59,24],[120,24,110]])/255 # for track vis
     for i in range(boxes.shape[0]):
@@ -205,20 +313,20 @@ def get_box(boxes, color=(0, 1, 0), ref_labels=None, score=None, line_thickness=
             if use_linemesh:
                 for lines in line_set:
                     if use_class_colors:
-                        lines.paint_uniform_color(box_colormap[ref_labels[i]])
+                        lines.paint_uniform_color(theme_cfg['class_box_colormap'][ref_labels[i]])
                     else:
                         lines.paint_uniform_color(color)
                     ret_boxes.append(lines)      
             else:
                 if use_class_colors:
-                    line_set.paint_uniform_color(box_colormap[ref_labels[i]])
+                    line_set.paint_uniform_color(theme_cfg['class_box_colormap'][ref_labels[i]])
                 else:
                     line_set.paint_uniform_color(color)
                 ret_boxes.append(line_set)
     return ret_boxes
 
 
-def translate_boxes_to_open3d_instance(gt_boxes, use_linemesh=False, line_thickness=0.04): # 0.02 was original
+def translate_boxes_to_open3d_instance(gt_boxes, use_linemesh=False, line_thickness=0.055): # 0.02 was original
     """
              4-------- 6
            /|         /|

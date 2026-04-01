@@ -1,0 +1,16 @@
+{
+    "classes": [
+        {
+            "name": "Pedestrian",
+            "id": 1,
+            "color": "#ff6b00"
+        }
+    ],
+    "default": 1,
+    "type": "object_detection",
+    "format": "kitti_untransformed",
+    "created_with": {
+        "name": "labelCloud",
+        "version": "1.1.1"
+    }
+}

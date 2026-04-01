@@ -108,16 +108,20 @@ def main():
 
     train_infos = make_infos(train_ids)
     val_infos = make_infos(val_ids)
+    test_infos = make_infos(test_ids)
 
     with (root / "custom_infos_train.pkl").open("wb") as f:
         pickle.dump(train_infos, f)
     with (root / "custom_infos_val.pkl").open("wb") as f:
         pickle.dump(val_infos, f)
+    with (root / "custom_infos_test.pkl").open("wb") as f:
+        pickle.dump(test_infos, f)
 
     print(f"Dataset root: {root}")
     print(f"Frames total/train/val/test: {len(all_frame_ids)}/{len(train_ids)}/{len(val_ids)}/{len(test_ids)}")
     print(f"Saved: {root / 'custom_infos_train.pkl'} ({len(train_infos)} infos)")
     print(f"Saved: {root / 'custom_infos_val.pkl'} ({len(val_infos)} infos)")
+    print(f"Saved: {root / 'custom_infos_test.pkl'} ({len(test_infos)} infos)")
     if odom is None:
         print("Odometry: not provided, used identity poses")
     else:

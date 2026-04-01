@@ -215,3 +215,7 @@ tools/cfgs/target_custom/label_generation/round*/ps_labels/
 tools/output/
 docs/
 AGENTS.md
+tools/.labelCloud.log
+tools/labels/
+.codex
+tools/labelcloud/.labelCloud.log

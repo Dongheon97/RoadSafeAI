@@ -81,3 +81,20 @@ def build_dataloader(dataset_cfg, class_names, batch_size, dist, root_path=None,
     )
 
     return dataset, dataloader, sampler
+
+from .custom.custom_mixup_dataset import CustomMixUpDataset
+__all__['CustomMixUpDataset'] = CustomMixUpDataset
+
+def build_mixup_dataloader(dataset_cfg, class_names, batch_size, dist, root_path=None, workers=4, logger=None, training=True, pseudo_info_path=None):
+    import torch
+    from torch.utils.data import DataLoader
+    dataset = __all__[dataset_cfg.DATASET_NAME](
+        dataset_cfg=dataset_cfg, class_names=class_names, root_path=root_path,
+        training=training, logger=logger, pseudo_info_path=pseudo_info_path
+    )
+    sampler = torch.utils.data.distributed.DistributedSampler(dataset) if dist else None
+    dataloader = DataLoader(
+        dataset, batch_size=batch_size, pin_memory=True, num_workers=workers,
+        shuffle=(sampler is None) and training, collate_fn=dataset.collate_batch, drop_last=False, sampler=sampler, timeout=0
+    )
+    return dataset, dataloader, sampler

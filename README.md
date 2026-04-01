@@ -119,3 +119,64 @@ Use the newly fine-tuned weights from Experiment B to re-evaluate the 34-frame v
 ```bash
 python test.py --cfg_file cfgs/custom_models/pv_rcnn.yaml --batch_size 1 --ckpt ../output/custom_models/pv_rcnn/default/ckpt/checkpoint_epoch_80.pth
 ```
+
+---
+## Get Dataset
+
+### 2. Download Required Assets
+Please download the following three archive files from our shared cloud drive [https://purdue0-my.sharepoint.com/my?id=%2Fpersonal%2Flin2289%5Fpurdue%5Fedu%2FDocuments%2FECE%2060001%20I2I%20Lidar&viewid=72894e5b%2D8d56%2D496f%2Dafbb%2Ded6fbe714f57]:
+1. `baseline_checkpoints.tar.gz` (Pre-trained KITTI weights for Source-Only Baseline)
+2. `my_trained_output.tar.gz` (Our fine-tuned Few-Shot weights)
+3. `custom_dataset.tar.gz` (The processed .npy point clouds and pedestrian labels)
+
+*Place these three `.tar.gz` files directly into the `RoadSafeAI/` root directory.*
+
+### 3. Extract Files to the Correct Directories
+Run the following commands in your terminal. The `tar` command will automatically create the required folders and extract the files into their exact original locations:
+
+```bash
+# Extract pre-trained baseline weights
+tar -xzvf baseline_checkpoints.tar.gz
+
+# Extract our fine-tuned weights (Epoch 80)
+tar -xzvf my_trained_output.tar.gz
+
+# Extract the custom dataset
+tar -xzvf custom_dataset.tar.gz
+```
+
+### 4. Verify Directory Structure
+After extraction, your `RoadSafeAI` folder should look exactly like this:
+
+```text
+RoadSafeAI/
+├── checkpoints/
+│   └── pv_rcnn_8369.pth                  <-- Source-Only Baseline Weight
+├── data/
+│   └── custom/                           <-- Extracted Dataset
+│       ├── ImageSets/
+│       ├── labels/
+│       ├── points/
+│       ├── custom_infos_train.pkl
+│       └── custom_infos_val.pkl
+└── output/
+    └── custom_models/
+        └── pv_rcnn/
+            └── default/
+                └── ckpt/
+                    └── checkpoint_epoch_80.pth  <-- Few-Shot Fine-tuned Weight
+```
+
+### 5. Run Evaluations!
+Once the files are in place, you can immediately run the evaluation scripts to reproduce the AP scores.
+
+**Test A: Source-Only Baseline (0% AP expected)**
+```bash
+cd tools
+python test.py --cfg_file cfgs/custom_models/pv_rcnn.yaml --batch_size 1 --ckpt ../checkpoints/pv_rcnn_8369.pth
+```
+
+**Test B: Few-Shot Fine-tuned Model (~84% AP expected)**
+```bash
+python test.py --cfg_file cfgs/custom_models/pv_rcnn.yaml --batch_size 1 --ckpt ../output/custom_models/pv_rcnn/default/ckpt/checkpoint_epoch_80.pth
+```

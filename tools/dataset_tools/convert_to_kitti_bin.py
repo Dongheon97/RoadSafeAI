@@ -2,6 +2,7 @@
 import argparse
 import csv
 import re
+import struct
 from pathlib import Path
 
 import numpy as np
@@ -105,7 +106,40 @@ def load_bin(path: Path):
 
 
 def load_npy(path: Path):
-    arr = np.load(path)
+    try:
+        arr = np.load(path)
+    except ValueError as exc:
+        # Some captured files have a stale .npy header shape but valid float32 payload.
+        # Recover by reading the payload directly and reshaping using the header column count.
+        with path.open("rb") as f:
+            magic = f.read(6)
+            if magic != b"\x93NUMPY":
+                raise
+            major, minor = f.read(1)[0], f.read(1)[0]
+            if major == 1:
+                header_len = struct.unpack("<H", f.read(2))[0]
+            elif major in (2, 3):
+                header_len = struct.unpack("<I", f.read(4))[0]
+            else:
+                raise ValueError(f"Unsupported .npy version {(major, minor)} for {path}") from exc
+
+            header = f.read(header_len).decode("latin1").strip()
+            if "'shape':" not in header:
+                raise
+
+            shape_text = header.split("'shape':", 1)[1].split(")", 1)[0] + ")"
+            shape = eval(shape_text, {"__builtins__": {}}, {})
+            if not isinstance(shape, tuple) or len(shape) == 0:
+                raise
+
+            ncols = shape[1] if len(shape) > 1 else 1
+            payload = np.fromfile(f, dtype=np.float32)
+            if payload.size % ncols != 0:
+                raise ValueError(
+                    f"Cannot recover malformed .npy {path}: payload size {payload.size} not divisible by {ncols}"
+                ) from exc
+            arr = payload.reshape(-1, ncols)
+            print(f"[recover_npy] {path.name}: header shape {shape} -> payload shape {arr.shape}")
     if arr.ndim == 1:
         for dim in (4, 5, 3):
             if arr.size % dim == 0:

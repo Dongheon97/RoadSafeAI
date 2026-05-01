@@ -1,3 +1,31 @@
+'''
+# visualize pickle files:
+xhost +local:root
+docker exec -it ms3d_training bash -lc "
+cd /MS3D/tools
+export PYTHONPATH=/MS3D:/MS3D/tracker
+export DISPLAY=:1
+python visualize_3d.py \
+  --cfg_file cfgs/dataset_configs/custom_points_dataset_da_v2.yaml \
+  --ps_pkl /MS3D/tools/cfgs/target_custom/label_generation/custom_points_round1/ps_labels/final_pseudo_labels_ped_zfit_15m.pkl \
+  --split train \
+  --idx 0 \
+  --ps_score_th 0.005 \
+  --interactive_step
+"
+docker exec ms3d_training bash -lc '
+cd /MS3D/tools
+export PYTHONPATH=/MS3D:/MS3D/tracker
+export DISPLAY=:1            
+python visualize_3d.py \
+  --cfg_file /MS3D/tools/cfgs/target_custom/ms3d_custom_round1_pv_rcnn_plusplus_points_nusc.yaml \
+  --ckpt /MS3D/output/target_custom/ms3d_custom_round1_pv_rcnn_plusplus_points_nusc/nusc_points_v3_pedps_bs4_e30/ckpt/checkpoint_epoch_30.pth \
+  --splits train \
+  --idx 0 \
+  --pred_score_th 0.01 \
+  --interactive_step 
+'
+'''
 import torch
 from pathlib import Path
 import sys
@@ -16,6 +44,35 @@ from pcdet.utils import box_fusion_utils
 from pcdet.utils import compatibility_utils as compat
 import numpy as np
 import time
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CAMERA_SAVE_PATH = REPO_ROOT / 'output' / 'visualize_3d' / 'last_camera.json'
+DEFAULT_VIEW_BY_MODE = {
+    'det_pkl': {
+        'front': [-0.009079385782427972, -0.79382993606647601, 0.60807203303433444],
+        'lookat': [0.13592805125144847, 25.565951040207825, -13.855443454771956],
+        'up': [-0.008889802784222859, 0.60813714531420293, 0.79378220180068892],
+        'zoom': 0.21999999999999992,
+    },
+    'ps_pkl': {
+        'front': [-0.009079385782427972, -0.79382993606647601, 0.60807203303433444],
+        'lookat': [0.13592805125144847, 25.565951040207825, -13.855443454771956],
+        'up': [-0.008889802784222859, 0.60813714531420293, 0.79378220180068892],
+        'zoom': 0.21999999999999992,
+    },
+    'dets_txt': {
+        'front': [0.72737973442893356, -0.51797808311597837, 0.45013045592760198],
+        'lookat': [-13.773417658854088, 0.062465858514556709, -0.53706070047660459],
+        'up': [-0.37595030931731882, 0.2479623453125949, 0.89284715390221758],
+        'zoom': 0.079999999999999946,
+    },
+    'ckpt': {
+        'front': [-0.009079385782427972, -0.79382993606647601, 0.60807203303433444],
+        'lookat': [0.13592805125144847, 25.565951040207825, -13.855443454771956],
+        'up': [-0.008889802784222859, 0.60813714531420293, 0.79378220180068892],
+        'zoom': 0.21999999999999992,
+    },
+}
 """
 # Examples
 python visualize_3d.py --cfg_file cfgs/target-nuscenes/ft_waymo_secondiou.yaml  \
@@ -62,12 +119,19 @@ def main():
                         help='Prediction score threshold for displaying boxes in interactive_step mode.')
     parser.add_argument('--ps_score_th', type=float, default=0.4,
                         help='Pseudo-label score threshold for displaying boxes from --ps_pkl.')
+    parser.add_argument('--pkl_points_mode', type=str, default='raw_1frame',
+                        choices=['raw_1frame', 'dataset_processed'],
+                        help='Point source for --det_pkl/--ps_pkl visualization. '
+                             'raw_1frame bypasses dataset preprocessing and SHIFT_COOR for easier '
+                             'coordinate debugging; dataset_processed preserves the previous behavior.')
     parser.add_argument('--theme', type=str, default='dark', choices=['dark', 'light'],
                         help='Open3D viewer theme.')
     parser.add_argument('--point_color_mode', type=str, default='height', choices=['height', 'mono'],
                         help='Point cloud coloring mode.')
     parser.add_argument('--point_size', type=float, default=2.0,
                         help='Open3D point size for all viewer modes.')
+    parser.add_argument('--line_width', type=float, default=4.0,
+                        help='Open3D line width for non-linemesh bounding boxes.')
     parser.add_argument('--window_x', type=int, default=2000,
                         help='Open3D window left position in pixels.')
     parser.add_argument('--window_y', type=int, default=300,
@@ -76,10 +140,118 @@ def main():
                         help='Open3D window width in pixels.')
     parser.add_argument('--window_height', type=int, default=3000,
                         help='Open3D window height in pixels.')
+    parser.add_argument('--camera_json', type=str, default=None,
+                        help='Optional camera json to load at startup. Relative paths are resolved from repo root.')
+    parser.add_argument('--camera_save_path', type=str, default=str(DEFAULT_CAMERA_SAVE_PATH),
+                        help='Path used for saving and auto-loading the camera viewpoint.')
     args = parser.parse_args()
 
     def apply_theme(vis_obj):
-        V.apply_render_theme(vis_obj, theme=args.theme, point_size=args.point_size)
+        V.apply_render_theme(
+            vis_obj,
+            theme=args.theme,
+            point_size=args.point_size,
+            line_width=args.line_width,
+        )
+
+    def resolve_repo_path(path_str):
+        path = Path(path_str)
+        if not path.is_absolute():
+            path = (REPO_ROOT / path).resolve()
+        return path
+
+    def create_window_or_raise(vis_obj, window_name):
+        window_ok = vis_obj.create_window(
+            window_name=window_name,
+            left=args.window_x,
+            top=args.window_y,
+            width=args.window_width,
+            height=args.window_height
+        )
+        if not window_ok:
+            display = os.environ.get('DISPLAY', '')
+            raise RuntimeError(
+                'Open3D window creation failed. '
+                f'DISPLAY="{display}". '
+                'Run container with X11 forwarding (DISPLAY + /tmp/.X11-unix mount).'
+            )
+
+    camera_save_path = resolve_repo_path(args.camera_save_path)
+
+    def load_saved_camera_if_exists(path, required=False):
+        if not path.exists():
+            if required:
+                raise FileNotFoundError(f'Camera file not found: {path}')
+            return None
+        try:
+            return o3d.io.read_pinhole_camera_parameters(str(path))
+        except Exception as exc:
+            if required:
+                raise RuntimeError(f'Failed to load camera parameters from {path}: {exc}') from exc
+            print(f'Warning: failed to load camera parameters from {path}: {exc}. Falling back to default view.')
+            return None
+
+    camera_state = {'params': None}
+    if args.camera_json is not None:
+        explicit_camera_path = resolve_repo_path(args.camera_json)
+        camera_state['params'] = load_saved_camera_if_exists(explicit_camera_path, required=True)
+        print(f'Loaded camera parameters from {explicit_camera_path}')
+    else:
+        camera_state['params'] = load_saved_camera_if_exists(camera_save_path, required=False)
+        if camera_state['params'] is not None:
+            print(f'Loaded saved camera parameters from {camera_save_path}')
+
+    def apply_default_view(vis_obj, mode_name):
+        ctr = vis_obj.get_view_control()
+        if ctr is None:
+            return
+        view = DEFAULT_VIEW_BY_MODE[mode_name]
+        ctr.set_front(view['front'])
+        ctr.set_lookat(view['lookat'])
+        ctr.set_up(view['up'])
+        ctr.set_zoom(view['zoom'])
+
+    def apply_saved_camera(vis_obj):
+        if camera_state['params'] is None:
+            return False
+        ctr = vis_obj.get_view_control()
+        if ctr is None:
+            return False
+        try:
+            try:
+                applied = ctr.convert_from_pinhole_camera_parameters(camera_state['params'], allow_arbitrary=True)
+            except TypeError:
+                applied = ctr.convert_from_pinhole_camera_parameters(camera_state['params'])
+        except Exception as exc:
+            print(f'Warning: failed to apply saved camera: {exc}. Falling back to default view.')
+            return False
+        if applied is False:
+            print('Warning: saved camera was rejected by Open3D. Falling back to default view.')
+            return False
+        return True
+
+    def apply_view(vis_obj, mode_name):
+        if not apply_saved_camera(vis_obj):
+            apply_default_view(vis_obj, mode_name)
+
+    def save_current_camera(vis_obj):
+        ctr = vis_obj.get_view_control()
+        if ctr is None:
+            print('Camera save skipped: Open3D view control is unavailable.')
+            return False
+        try:
+            camera_params = ctr.convert_to_pinhole_camera_parameters()
+            camera_save_path.parent.mkdir(parents=True, exist_ok=True)
+            ok = o3d.io.write_pinhole_camera_parameters(str(camera_save_path), camera_params)
+        except Exception as exc:
+            print(f'Failed to save camera parameters to {camera_save_path}: {exc}')
+            return False
+        if not ok:
+            print(f'Failed to save camera parameters to {camera_save_path}')
+            return False
+        camera_state['params'] = camera_params
+        print(f'Saved camera parameters to {camera_save_path}. This viewpoint will be reused for subsequent frames.')
+        return False
 
     geom_kwargs = {
         'use_linemesh': args.use_linemesh,
@@ -131,6 +303,28 @@ def main():
 
     idx_to_frameid = {v: k for k, v in target_set.frameid_to_idx.items()}
 
+    raw_gt_warning_shown = {'shown': False}
+
+    def get_pkl_render_sample(frame_id):
+        ds_idx = target_set.frameid_to_idx[frame_id]
+        if args.pkl_points_mode == 'dataset_processed':
+            sample = target_set[ds_idx]
+            return sample['points'], sample['gt_boxes']
+
+        raw_points = np.asarray(compat.get_lidar(target_set, frame_id))
+        if raw_points.ndim != 2 or raw_points.shape[1] < 3:
+            raise ValueError(
+                f'Expected raw lidar with shape (N, >=3) for frame {frame_id}, '
+                f'got {raw_points.shape}'
+            )
+
+        if args.show_gt and not raw_gt_warning_shown['shown']:
+            print('Warning: --show_gt is disabled in pkl raw_1frame mode because GT boxes are '
+                  'not remapped into the raw point frame.')
+            raw_gt_warning_shown['shown'] = True
+
+        return raw_points, None
+
     # If no pkl file, just show point cloud and gt boxes (optional)
     if (args.det_pkl is None) and (args.ps_pkl is None) and (args.dets_txt is None) and (args.ckpt is None):    
         for idx, data_dict in enumerate(target_loader):
@@ -144,7 +338,7 @@ def main():
                           window_x=args.window_x, window_y=args.window_y,
                           window_width=args.window_width, window_height=args.window_height,
                           theme=args.theme, point_color_mode=args.point_color_mode,
-                          point_size=args.point_size)
+                          point_size=args.point_size, line_width=args.line_width)
 
     # Visualize pkls
     if (args.det_pkl is not None) or (args.ps_pkl is not None) or (args.dets_txt is not None):    
@@ -165,29 +359,14 @@ def main():
             state = {'pos': start_pos}
 
             vis = o3d.visualization.VisualizerWithKeyCallback()
-            window_ok = vis.create_window(
-                window_name='RoadSafeAI PKL Step Viewer',
-                left=args.window_x,
-                top=args.window_y,
-                width=args.window_width,
-                height=args.window_height
-            )
-            if not window_ok:
-                display = os.environ.get('DISPLAY', '')
-                raise RuntimeError(
-                    'Open3D window creation failed. '
-                    f'DISPLAY="{display}". '
-                    'Run container with X11 forwarding (DISPLAY + /tmp/.X11-unix mount).'
-                )
+            create_window_or_raise(vis, 'RoadSafeAI PKL Step Viewer')
 
             def render_det_frame(vis_obj):
                 det_idx = valid_indices[state['pos']]
                 det_anno = det_annos[det_idx]
                 frame_id = det_anno['frame_id']
-                sample = target_set[target_set.frameid_to_idx[frame_id]]
-                pts = sample['points']
-                gt_boxes = sample['gt_boxes']
-                score_mask = det_anno['score'] > 0.2
+                pts, gt_boxes = get_pkl_render_sample(frame_id)
+                score_mask = det_anno['score'] > args.pred_score_th
                 geom = V.get_geometries(
                     points=pts,
                     gt_boxes=gt_boxes if args.show_gt else None,
@@ -199,12 +378,7 @@ def main():
                 vis_obj.clear_geometries()
                 for g in geom:
                     vis_obj.add_geometry(g)
-                ctr = vis_obj.get_view_control()
-                if ctr is not None:
-                    ctr.set_front([ -0.009079385782427972, -0.79382993606647601, 0.60807203303433444 ])
-                    ctr.set_lookat([ 0.13592805125144847, 25.565951040207825, -13.855443454771956  ])
-                    ctr.set_up([-0.008889802784222859, 0.60813714531420293, 0.79378220180068892 ])
-                    ctr.set_zoom(0.21999999999999992)
+                apply_view(vis_obj, 'det_pkl')
                 apply_theme(vis_obj)
                 vis_obj.update_renderer()
                 print(
@@ -239,7 +413,8 @@ def main():
             vis.register_key_callback(263, on_prev)
             vis.register_key_callback(ord('Q'), on_q)
             vis.register_key_callback(256, on_q)
-            print('PKL mode: Space/N/Right = next, B/Left = previous, Q/Esc = quit')
+            vis.register_key_callback(ord('S'), save_current_camera)
+            print('PKL mode: Space/N/Right = next, B/Left = previous, S = save camera, Q/Esc = quit')
             render_det_frame(vis)
             vis.run()
             vis.destroy_window()
@@ -263,30 +438,16 @@ def main():
             state = {'pos': start_pos}
 
             vis = o3d.visualization.VisualizerWithKeyCallback()
-            window_ok = vis.create_window(
-                window_name='RoadSafeAI PKL Step Viewer',
-                left=args.window_x,
-                top=args.window_y,
-                width=args.window_width,
-                height=args.window_height
-            )
-            if not window_ok:
-                display = os.environ.get('DISPLAY', '')
-                raise RuntimeError(
-                    'Open3D window creation failed. '
-                    f'DISPLAY="{display}". '
-                    'Run container with X11 forwarding (DISPLAY + /tmp/.X11-unix mount).'
-                )
+            create_window_or_raise(vis, 'RoadSafeAI PKL Step Viewer')
 
             def render_ps_frame(vis_obj):
                 ds_idx = valid_indices[state['pos']]
-                sample = target_set[ds_idx]
                 frame_id = idx_to_frameid[ds_idx]
-                gt_boxes = sample['gt_boxes']
+                pts, gt_boxes = get_pkl_render_sample(frame_id)
                 ps_mask = ps_dict[frame_id]['gt_boxes'][:,8] > args.ps_score_th
                 ref_boxes2 = ps_dict2[frame_id]['gt_boxes'][:,:7] if args.ps_pkl2 is not None else None
                 geom = V.get_geometries(
-                    points=sample['points'],
+                    points=pts,
                     gt_boxes=gt_boxes if args.show_gt else None,
                     ref_boxes=ps_dict[frame_id]['gt_boxes'][:,:7][ps_mask],
                     ref_boxes2=ref_boxes2,
@@ -297,12 +458,7 @@ def main():
                 vis_obj.clear_geometries()
                 for g in geom:
                     vis_obj.add_geometry(g)
-                ctr = vis_obj.get_view_control()
-                if ctr is not None:
-                    ctr.set_front([ -0.009079385782427972, -0.79382993606647601, 0.60807203303433444 ])
-                    ctr.set_lookat([ 0.13592805125144847, 25.565951040207825, -13.855443454771956  ])
-                    ctr.set_up([-0.008889802784222859, 0.60813714531420293, 0.79378220180068892 ])
-                    ctr.set_zoom(0.21999999999999992)
+                apply_view(vis_obj, 'ps_pkl')
                 apply_theme(vis_obj)
                 vis_obj.update_renderer()
                 shown_boxes = int(ps_mask.sum())
@@ -339,7 +495,8 @@ def main():
             vis.register_key_callback(263, on_prev)
             vis.register_key_callback(ord('Q'), on_q)
             vis.register_key_callback(256, on_q)
-            print('PKL mode: Space/N/Right = next, B/Left = previous, Q/Esc = quit')
+            vis.register_key_callback(ord('S'), save_current_camera)
+            print('PKL mode: Space/N/Right = next, B/Left = previous, S = save camera, Q/Esc = quit')
             render_ps_frame(vis)
             vis.run()
             vis.destroy_window()
@@ -361,20 +518,7 @@ def main():
             state = {'pos': start_pos}
 
             vis = o3d.visualization.VisualizerWithKeyCallback()
-            window_ok = vis.create_window(
-                window_name='RoadSafeAI PKL Step Viewer',
-                left=args.window_x,
-                top=args.window_y,
-                width=args.window_width,
-                height=args.window_height
-            )
-            if not window_ok:
-                display = os.environ.get('DISPLAY', '')
-                raise RuntimeError(
-                    'Open3D window creation failed. '
-                    f'DISPLAY="{display}". '
-                    'Run container with X11 forwarding (DISPLAY + /tmp/.X11-unix mount).'
-                )
+            create_window_or_raise(vis, 'RoadSafeAI PKL Step Viewer')
 
             cmap = np.array([[49,131,106],[193, 107, 107],[110, 163, 167],[214, 206, 114],[49,131,106],[110, 163, 167],[214, 206, 114]])/255
 
@@ -403,12 +547,7 @@ def main():
                 vis_obj.clear_geometries()
                 for g in geom:
                     vis_obj.add_geometry(g)
-                ctr = vis_obj.get_view_control()
-                if ctr is not None:
-                    ctr.set_front([ 0.72737973442893356, -0.51797808311597837, 0.45013045592760198 ])
-                    ctr.set_lookat([ -13.773417658854088, 0.062465858514556709, -0.53706070047660459 ])
-                    ctr.set_up([ -0.37595030931731882, 0.2479623453125949, 0.89284715390221758 ])
-                    ctr.set_zoom(0.079999999999999946)
+                apply_view(vis_obj, 'dets_txt')
                 apply_theme(vis_obj)
                 vis_obj.update_renderer()
                 print(f"[dets_txt {state['pos']+1}/{len(valid_indices)}] frame_idx={det_idx} frame_id={frame_id}")
@@ -440,7 +579,8 @@ def main():
             vis.register_key_callback(263, on_prev)
             vis.register_key_callback(ord('Q'), on_q)
             vis.register_key_callback(256, on_q)
-            print('PKL mode: Space/N/Right = next, B/Left = previous, Q/Esc = quit')
+            vis.register_key_callback(ord('S'), save_current_camera)
+            print('PKL mode: Space/N/Right = next, B/Left = previous, S = save camera, Q/Esc = quit')
             render_msda_frame(vis)
             vis.run()
             vis.destroy_window()
@@ -473,20 +613,7 @@ def main():
                 return ', '.join([f'{k}:{v}' for k, v in sorted(class_counts.items())])
 
             vis = o3d.visualization.VisualizerWithKeyCallback()
-            window_ok = vis.create_window(
-                window_name='RoadSafeAI Detection Step Viewer',
-                left=args.window_x,
-                top=args.window_y,
-                width=args.window_width,
-                height=args.window_height
-            )
-            if not window_ok:
-                display = os.environ.get('DISPLAY', '')
-                raise RuntimeError(
-                    'Open3D window creation failed. '
-                    f'DISPLAY="{display}". '
-                    'Run container with X11 forwarding (DISPLAY + /tmp/.X11-unix mount).'
-                )
+            create_window_or_raise(vis, 'RoadSafeAI Detection Step Viewer')
 
             def render_frame(vis_obj):
                 data_dict = target_set.collate_batch([target_set[state['idx']]])
@@ -518,12 +645,7 @@ def main():
                 for g in geom:
                     vis_obj.add_geometry(g)
 
-                ctr = vis_obj.get_view_control()
-                if ctr is not None:
-                    ctr.set_front([ -0.009079385782427972, -0.79382993606647601, 0.60807203303433444 ])
-                    ctr.set_lookat([ 0.13592805125144847, 25.565951040207825, -13.855443454771956  ])
-                    ctr.set_up([-0.008889802784222859, 0.60813714531420293, 0.79378220180068892 ])
-                    ctr.set_zoom(0.21999999999999992)
+                apply_view(vis_obj, 'ckpt')
                 apply_theme(vis_obj)
                 vis_obj.update_renderer()
 
@@ -554,8 +676,9 @@ def main():
             vis.register_key_callback(ord(' '), on_space)
             vis.register_key_callback(ord('Q'), on_q)
             vis.register_key_callback(ord('N'), on_space)
+            vis.register_key_callback(ord('S'), save_current_camera)
 
-            print('Interactive mode: Space/N = next frame, Q = quit')
+            print('Interactive mode: Space/N = next frame, S = save camera, Q = quit')
             print(f"Starting from idx={state['idx']}, split={args.split}, score_th={args.pred_score_th:.2f}")
             render_frame(vis)
             vis.run()
@@ -697,7 +820,7 @@ def main():
                             window_x=args.window_x, window_y=args.window_y,
                             window_width=args.window_width, window_height=args.window_height,
                             theme=args.theme, point_color_mode=args.point_color_mode,
-                            point_size=args.point_size
+                            point_size=args.point_size, line_width=args.line_width
                         )
 
 

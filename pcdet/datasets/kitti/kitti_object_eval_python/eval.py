@@ -592,6 +592,8 @@ def do_eval(gt_annos,
 
     if PR_detail_dict is not None:
         PR_detail_dict['bbox'] = ret['precision']
+        PR_detail_dict['bbox_precision'] = ret['precision']
+        PR_detail_dict['bbox_recall'] = ret['recall']
 
     mAP_aos = mAP_aos_R40 = None
     if compute_aos:
@@ -600,6 +602,7 @@ def do_eval(gt_annos,
 
         if PR_detail_dict is not None:
             PR_detail_dict['aos'] = ret['orientation']
+            PR_detail_dict['aos_precision'] = ret['orientation']
 
     ret = eval_class(gt_annos, dt_annos, current_classes, difficultys, 1,
                      min_overlaps)
@@ -608,6 +611,8 @@ def do_eval(gt_annos,
 
     if PR_detail_dict is not None:
         PR_detail_dict['bev'] = ret['precision']
+        PR_detail_dict['bev_precision'] = ret['precision']
+        PR_detail_dict['bev_recall'] = ret['recall']
 
     ret = eval_class(gt_annos, dt_annos, current_classes, difficultys, 2,
                      min_overlaps)
@@ -615,6 +620,8 @@ def do_eval(gt_annos,
     mAP_3d_R40 = get_mAP_R40(ret["precision"])
     if PR_detail_dict is not None:
         PR_detail_dict['3d'] = ret['precision']
+        PR_detail_dict['3d_precision'] = ret['precision']
+        PR_detail_dict['3d_recall'] = ret['recall']
     return mAP_bbox, mAP_bev, mAP_3d, mAP_aos, mAP_bbox_R40, mAP_bev_R40, mAP_3d_R40, mAP_aos_R40
 
 
@@ -663,6 +670,9 @@ def get_official_eval_result(gt_annos, dt_annos, current_classes, PR_detail_dict
             current_classes_int.append(curcls)
     current_classes = current_classes_int
     min_overlaps = min_overlaps[:, :, current_classes]
+    if PR_detail_dict is not None:
+        PR_detail_dict['min_overlaps'] = min_overlaps
+        PR_detail_dict['current_classes'] = list(current_classes)
     result = ''
     # check whether alpha is valid
     compute_aos = False

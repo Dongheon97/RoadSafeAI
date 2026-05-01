@@ -1,0 +1,1 @@
+/MS3D/output/nuscenes_models/uda_pv_rcnn_plusplus_resnet_anchorhead/default/eval/epoch_10/val/nusc_custom_points_trainall/result.pkl,1,1,1

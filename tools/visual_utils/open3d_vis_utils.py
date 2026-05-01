@@ -69,7 +69,7 @@ def get_theme_config(theme='dark'):
     return THEME_CONFIGS.get(theme, THEME_CONFIGS['dark'])
 
 
-def apply_render_theme(vis, theme='dark', point_size=2.0):
+def apply_render_theme(vis, theme='dark', point_size=2.0, line_width=4.0):
     render_opt = vis.get_render_option()
     if render_opt is None:
         return
@@ -77,7 +77,7 @@ def apply_render_theme(vis, theme='dark', point_size=2.0):
     render_opt.background_color = theme_cfg['background_color']
     render_opt.point_size = point_size
     if hasattr(render_opt, 'line_width'):
-        render_opt.line_width = 2.0
+        render_opt.line_width = line_width
 
 
 def get_point_colors(points, point_color_mode='height', theme='dark'):
@@ -139,7 +139,7 @@ def _run_blocking_window(vis):
 
 def draw_scenes_msda(points, idx, gt_boxes, det_annos, draw_origin=False, min_score=0.2, use_linemesh=False,
                      window_x=50, window_y=50, window_width=1600, window_height=960,
-                     theme='dark', point_color_mode='height', point_size=2.0):
+                     theme='dark', point_color_mode='height', point_size=2.0, line_width=4.0):
 
     vis = open3d.visualization.VisualizerWithKeyCallback()
     vis.create_window(left=window_x, top=window_y, width=window_width, height=window_height)
@@ -186,13 +186,13 @@ def draw_scenes_msda(points, idx, gt_boxes, det_annos, draw_origin=False, min_sc
     ctr.set_up([ -0.37595030931731882, 0.2479623453125949, 0.89284715390221758 ])
     ctr.set_zoom(0.079999999999999946)
 
-    apply_render_theme(vis, theme=theme, point_size=point_size)
+    apply_render_theme(vis, theme=theme, point_size=point_size, line_width=line_width)
     _run_blocking_window(vis)
 
 def draw_scenes(points=None, gt_boxes=None, ref_boxes=None, ref_boxes2=None, ref_labels=None, ref_scores=None, ref_box_colors=None, 
                 point_colors=None, draw_origin=False, use_linemesh=False,use_class_colors=True,
                 window_x=50, window_y=50, window_width=1600, window_height=960,
-                theme='dark', point_color_mode='height', point_size=2.0):
+                theme='dark', point_color_mode='height', point_size=2.0, line_width=4.0):
 
     vis = open3d.visualization.VisualizerWithKeyCallback()
     vis.create_window(left=window_x, top=window_y, width=window_width, height=window_height)
@@ -201,7 +201,7 @@ def draw_scenes(points=None, gt_boxes=None, ref_boxes=None, ref_boxes2=None, ref
                           ref_boxes=ref_boxes, ref_boxes2=ref_boxes2, ref_labels=ref_labels, 
                           ref_scores=ref_scores, ref_box_colors=ref_box_colors, use_class_colors=use_class_colors,
                           point_colors=point_colors, draw_origin=draw_origin,
-                          line_thickness=0.075, use_linemesh=use_linemesh,
+                          line_thickness=0.0001, use_linemesh=use_linemesh,
                           theme=theme, point_color_mode=point_color_mode)
     vis.clear_geometries()
     for g in geom:                
@@ -215,7 +215,7 @@ def draw_scenes(points=None, gt_boxes=None, ref_boxes=None, ref_boxes2=None, ref
     ctr.set_lookat([ 0.13592805125144847, 25.565951040207825, -13.855443454771956  ])
     ctr.set_up([-0.008889802784222859, 0.60813714531420293, 0.79378220180068892 ])
     ctr.set_zoom(0.21999999999999992)
-    apply_render_theme(vis, theme=theme, point_size=point_size)
+    apply_render_theme(vis, theme=theme, point_size=point_size, line_width=line_width)
 
     # Original, zoom in, ego vehicle moving towards
     # ctr.set_front([ 0.59083558928204927, 0.44198102848405585, 0.6749563518464804 ])
@@ -234,7 +234,7 @@ def draw_scenes(points=None, gt_boxes=None, ref_boxes=None, ref_boxes2=None, ref
 
 def get_geometries(points, gt_boxes=None, ref_boxes=None, ref_labels=None, ref_boxes2=None, 
                    ref_scores=None, ref_box_colors=None, point_colors=None, use_class_colors=True,
-                   draw_origin=False, line_thickness=0.075, use_linemesh=False,
+                   draw_origin=False, line_thickness=0.03, use_linemesh=False,
                    theme='dark', point_color_mode='height'):
     if isinstance(points, torch.Tensor):
         points = points.cpu().numpy()
@@ -289,7 +289,7 @@ def get_geometries(points, gt_boxes=None, ref_boxes=None, ref_labels=None, ref_b
 
     return geometries
 
-def get_box(boxes, color=(0, 1, 0), ref_labels=None, score=None, line_thickness=0.075, use_linemesh=True, use_class_colors=True, theme='dark'): #0.02
+def get_box(boxes, color=(0, 1, 0), ref_labels=None, score=None, line_thickness=0.03, use_linemesh=True, use_class_colors=True, theme='dark'): #0.02
     """
     Linemesh gives much thicker box lines but is extremely slow. Use only if you don't need to change viewpoint
     """

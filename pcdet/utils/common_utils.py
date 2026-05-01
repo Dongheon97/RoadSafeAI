@@ -57,24 +57,6 @@ def rotate_points_along_z(points, angle):
     return points_rot.numpy() if is_numpy else points_rot
 
 
-def angle2matrix(angle):
-    """
-    Args:
-        angle: angle along z-axis, angle increases x ==> y
-    Returns:
-        rot_matrix: (3x3 Tensor) rotation matrix
-    """
-
-    cosa = torch.cos(angle)
-    sina = torch.sin(angle)
-    rot_matrix = torch.tensor([
-        [cosa, -sina, 0],
-        [sina, cosa,  0],
-        [   0,    0,  1]
-    ])
-    return rot_matrix
-
-
 def mask_points_by_range(points, limit_range):
     mask = (points[:, 0] >= limit_range[0]) & (points[:, 0] <= limit_range[3]) \
            & (points[:, 1] >= limit_range[1]) & (points[:, 1] <= limit_range[4])
@@ -187,13 +169,8 @@ def init_dist_slurm(tcp_port, local_rank, backend='nccl'):
 
 
 def init_dist_pytorch(tcp_port, local_rank, backend='nccl'):
-    # Un-commenting mp spawn below will lead to high variance in GPU usage across devices
-    # Also, dataloader initialization will lead to huge GPU:0 usage
-    # Because only one of torch.distributed.launch OR torch.multiprocessing
-    # is needed for correctly scheduling multi-gpu training. dist_train.sh already uses the former
-    # if mp.get_start_method(allow_none=True) is None:
-    #     mp.set_start_method('spawn')
-
+    if mp.get_start_method(allow_none=True) is None:
+        mp.set_start_method('spawn')
     # os.environ['MASTER_PORT'] = str(tcp_port)
     # os.environ['MASTER_ADDR'] = 'localhost'
     num_gpus = torch.cuda.device_count()
@@ -281,7 +258,6 @@ def sa_create(name, var):
     x.flags.writeable = False
     return x
 
-
 class AverageMeter(object):
     """Computes and stores the average and current value"""
     def __init__(self):
@@ -298,3 +274,88 @@ class AverageMeter(object):
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count
+
+class NAverageMeter(object):
+    """
+    Contain N AverageMeter and update respectively or simultaneously
+    """
+    def __init__(self, n):
+        self.n = n
+        self.meters = [AverageMeter() for i in range(n)]
+
+    def update(self, val, index=None, attribute='avg'):
+        if isinstance(val, list) and index is None:
+            assert len(val) == self.n
+            for i in range(self.n):
+                self.meters[i].update(val[i])
+        elif isinstance(val, NAverageMeter) and index is None:
+            assert val.n == self.n
+            for i in range(self.n):
+                self.meters[i].update(getattr(val.meters[i], attribute))
+        elif not isinstance(val, list) and index is not None:
+            self.meters[index].update(val)
+        else:
+            raise ValueError
+
+    def aggregate_result(self):
+        result = "("
+        for i in range(self.n):
+            result += "{:.3f},".format(self.meters[i].avg)
+        result += ')'
+        return result
+
+
+def calculate_gradient_norm(model):
+    total_norm = 0
+    for p in model.parameters():
+        param_norm = p.grad.data.norm(2)
+        total_norm += param_norm.item() ** 2
+    total_norm = total_norm ** (1. / 2)
+    return total_norm
+
+
+def mask_dict(result_dict, mask):
+    new_dict = copy.deepcopy(result_dict)
+    for key, value in new_dict.items():
+        new_dict[key] = value[mask]
+    return new_dict
+
+
+def concatenate_array_inside_dict(merged_dict, result_dict):
+    for key, val in result_dict.items():
+        if key not in merged_dict:
+            merged_dict[key] = copy.deepcopy(val)
+        else:
+            merged_dict[key] = np.concatenate([merged_dict[key], copy.deepcopy(val)])
+
+    return merged_dict
+
+def add_prefix_to_dict(dict, prefix):
+    for key in list(dict.keys()):
+        dict[prefix + key] = dict.pop(key)
+    return dict
+
+class DataReader(object):
+    def __init__(self, dataloader, sampler):
+        self.dataloader = dataloader
+        self.sampler = sampler
+
+    def construct_iter(self):
+        self.dataloader_iter = iter(self.dataloader)
+
+    def set_cur_epoch(self, cur_epoch):
+        self.cur_epoch = cur_epoch
+
+    def read_data(self):
+        try:
+            return self.dataloader_iter.next()
+        except:
+            if self.sampler is not None:
+                self.sampler.set_epoch(self.cur_epoch)
+            self.construct_iter()
+            return self.dataloader_iter.next()
+
+def set_bn_train(m):
+    classname = m.__class__.__name__
+    if classname.find('BatchNorm') != -1:
+        m.train()    

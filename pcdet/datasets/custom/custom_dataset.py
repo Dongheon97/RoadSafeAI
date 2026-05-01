@@ -1,283 +1,406 @@
 import copy
 import pickle
-import os
+from pathlib import Path
 
 import numpy as np
 
-from ...ops.roiaware_pool3d import roiaware_pool3d_utils
-from ...utils import box_utils, common_utils
 from ..dataset import DatasetTemplate
 
 
 class CustomDataset(DatasetTemplate):
+    """
+    Custom target dataset loader for flat OpenPCDet-style layout:
+      data/custom_dataset/
+        training/velodyne/*.bin
+        ImageSets/{train,val,test}.txt
+        custom_infos_{train,val}.pkl
+    """
+
     def __init__(self, dataset_cfg, class_names, training=True, root_path=None, logger=None):
-        """
-        Args:
-            root_path:
-            dataset_cfg:
-            class_names:
-            training:
-            logger:
-        """
         super().__init__(
             dataset_cfg=dataset_cfg, class_names=class_names, training=training, root_path=root_path, logger=logger
         )
+        self.infos = []
+        self.frameid_to_idx = {}
+        self.seq_name_to_infos = {}
+        self.seq_name_to_len = {}
+        self.seq_name_to_sample = {}
         self.split = self.dataset_cfg.DATA_SPLIT[self.mode]
+        self.include_data()
 
-        split_dir = os.path.join(self.root_path, 'ImageSets', (self.split + '.txt'))
-        self.sample_id_list = [x.strip() for x in open(split_dir).readlines()] if os.path.exists(split_dir) else None
+    def include_data(self):
+        if self.logger is not None:
+            self.logger.info("Loading CustomDataset")
 
-        self.custom_infos = []
-        self.include_data(self.mode)
-        self.map_class_to_kitti = self.dataset_cfg.MAP_CLASS_TO_KITTI
-
-    def include_data(self, mode):
-        self.logger.info('Loading Custom dataset.')
         custom_infos = []
-
-        for info_path in self.dataset_cfg.INFO_PATH[mode]:
+        for info_path in self.dataset_cfg.INFO_PATH[self.split]:
             info_path = self.root_path / info_path
             if not info_path.exists():
                 continue
-            with open(info_path, 'rb') as f:
+            with open(info_path, "rb") as f:
                 infos = pickle.load(f)
                 custom_infos.extend(infos)
 
-        self.custom_infos.extend(custom_infos)
-        self.logger.info('Total samples for CUSTOM dataset: %d' % (len(custom_infos)))
+        # Optional downsampling for large datasets.
+        sampled_interval = 1
+        if self.dataset_cfg.get("SAMPLED_INTERVAL", None):
+            sampled_interval = int(self.dataset_cfg.SAMPLED_INTERVAL[self.mode])
+        if sampled_interval > 1:
+            custom_infos = [custom_infos[i] for i in range(0, len(custom_infos), sampled_interval)]
 
-    def get_label(self, idx):
-        label_file = self.root_path / 'labels' / ('%s.txt' % idx)
-        assert label_file.exists()
-        with open(label_file, 'r') as f:
-            lines = f.readlines()
+        self.infos = custom_infos
+        self.seq_name_to_infos = {}
+        self.seq_name_to_sample = {}
 
-        # [N, 8]: (x y z dx dy dz heading_angle category_id)
-        gt_boxes = []
-        gt_names = []
-        for line in lines:
-            line_list = line.strip().split(' ')
-            gt_boxes.append(line_list[:-1])
-            gt_names.append(line_list[-1])
+        for idx, info in enumerate(self.infos):
+            frame_id = str(info.get("frame_id", idx))
+            info["frame_id"] = frame_id
+            self.frameid_to_idx[frame_id] = idx
 
-        return np.array(gt_boxes, dtype=np.float32), np.array(gt_names)
+            pc_info = info.setdefault("point_cloud", {})
+            seq_name = str(pc_info.get("lidar_sequence", "custom_seq_0"))
+            sample_idx = int(pc_info.get("sample_idx", idx))
+            pc_info["lidar_sequence"] = seq_name
+            pc_info["sample_idx"] = sample_idx
+            pc_info.setdefault("lidar_idx", frame_id)
+            pc_info.setdefault("num_features", 4)
 
-    def get_lidar(self, idx):
-        lidar_file = self.root_path / 'points' / ('%s.npy' % idx)
-        assert lidar_file.exists()
-        point_features = np.load(lidar_file)
-        return point_features
+            info.setdefault("timestamp", sample_idx)
+            if "pose" not in info:
+                info["pose"] = np.eye(4, dtype=np.float32)
+            info["pose"] = np.asarray(info["pose"], dtype=np.float32).reshape(4, 4)
 
-    def set_split(self, split):
-        super().__init__(
-            dataset_cfg=self.dataset_cfg, class_names=self.class_names, training=self.training,
-            root_path=self.root_path, logger=self.logger
-        )
-        self.split = split
+            # Keep raw info format but normalize for compatibility utilities.
+            if info.get("annos", None) is None:
+                info["annos"] = {"name": np.array([]), "gt_boxes_lidar": np.empty((0, 7), dtype=np.float32)}
+            else:
+                annos = info["annos"]
+                annos["name"] = np.asarray(annos.get("name", []))
+                annos["gt_boxes_lidar"] = np.asarray(
+                    annos.get("gt_boxes_lidar", np.empty((0, 7), dtype=np.float32)), dtype=np.float32
+                )
+                for key in ["bbox", "alpha", "difficulty", "occluded", "truncated"]:
+                    if key in annos:
+                        annos[key] = np.asarray(annos[key])
 
-        split_dir = self.root_path / 'ImageSets' / (self.split + '.txt')
-        self.sample_id_list = [x.strip() for x in open(split_dir).readlines()] if split_dir.exists() else None
+            if seq_name not in self.seq_name_to_infos:
+                self.seq_name_to_infos[seq_name] = []
+            self.seq_name_to_infos[seq_name].append(info)
+
+        self.seq_name_to_len = {}
+        for seq_name, seq_infos in self.seq_name_to_infos.items():
+            seq_infos.sort(key=lambda x: x["point_cloud"]["sample_idx"])
+            self.seq_name_to_len[seq_name] = len(seq_infos)
+            self.seq_name_to_sample[seq_name] = {
+                int(x["point_cloud"]["sample_idx"]): x for x in seq_infos
+            }
+
+        if self.logger is not None:
+            self.logger.info("Total samples for CustomDataset: %d", len(self.infos))
 
     def __len__(self):
         if self._merge_all_iters_to_one_epoch:
-            return len(self.sample_id_list) * self.total_epochs
+            return len(self.infos) * self.total_epochs
+        return len(self.infos)
 
-        return len(self.custom_infos)
+    @staticmethod
+    def remove_ego_points(points, center_radius=1.0):
+        mask = ~((np.abs(points[:, 0]) < center_radius) & (np.abs(points[:, 1]) < center_radius))
+        return points[mask]
+
+    def get_lidar(self, lidar_path):
+        lidar_path = Path(lidar_path)
+        if not lidar_path.is_absolute():
+            lidar_path = self.root_path / lidar_path
+
+        points = np.fromfile(str(lidar_path), dtype=np.float32)
+        if points.size == 0:
+            return np.zeros((0, 4), dtype=np.float32)
+
+        for dim in (4, 5, 3):
+            if points.size % dim == 0:
+                pts = points.reshape(-1, dim)
+                if dim >= 4:
+                    return pts[:, :4].astype(np.float32)
+                xyz = pts[:, :3].astype(np.float32)
+                return np.hstack([xyz, np.zeros((xyz.shape[0], 1), dtype=np.float32)])
+        raise ValueError(f"Cannot infer point dimension for {lidar_path}")
+
+    def get_sequence_data(self, info, points, sequence_name, sample_idx, max_sweeps):
+        ego_remove_radius = float(self.dataset_cfg.get("EGO_REMOVE_RADIUS", 1.5))
+        points = self.remove_ego_points(points, center_radius=ego_remove_radius)
+        points = np.hstack([points, np.zeros((points.shape[0], 1), dtype=points.dtype)])  # + timestamp
+
+        if max_sweeps <= 1:
+            return points
+
+        sample_map = self.seq_name_to_sample.get(sequence_name, {})
+        if sample_idx not in sample_map:
+            return points
+
+        pose_cur = np.asarray(info["pose"], dtype=np.float32).reshape(4, 4)
+        prev_points_all = []
+        prev_indices = np.arange(max(0, sample_idx - int(max_sweeps) + 1), sample_idx, dtype=np.int32)
+        for sample_idx_pre in prev_indices:
+            prev_info = sample_map.get(int(sample_idx_pre))
+            if prev_info is None:
+                continue
+            points_pre = self.get_lidar(prev_info["lidar_path"])
+            points_pre = self.remove_ego_points(points_pre, center_radius=ego_remove_radius)
+
+            pose_pre = np.asarray(prev_info["pose"], dtype=np.float32).reshape(4, 4)
+            expand_points_pre = np.concatenate([points_pre[:, :3], np.ones((points_pre.shape[0], 1), dtype=np.float32)], axis=1)
+            points_pre_global = (expand_points_pre @ pose_pre.T)[:, :3]
+            expand_points_pre_global = np.concatenate(
+                [points_pre_global, np.ones((points_pre_global.shape[0], 1), dtype=np.float32)], axis=1
+            )
+            points_pre_cur = (expand_points_pre_global @ np.linalg.inv(pose_cur).T)[:, :3]
+
+            cur = np.concatenate([points_pre_cur, points_pre[:, 3:4]], axis=1)
+            rel_t = 0.1 * (sample_idx - sample_idx_pre) * np.ones((cur.shape[0], 1), dtype=np.float32)
+            cur = np.hstack([cur, rel_t])
+            prev_points_all.append(cur)
+
+        if prev_points_all:
+            points = np.concatenate([points] + prev_points_all, axis=0).astype(np.float32)
+        return points
 
     def __getitem__(self, index):
         if self._merge_all_iters_to_one_epoch:
-            index = index % len(self.custom_infos)
+            index = index % len(self.infos)
 
-        info = copy.deepcopy(self.custom_infos[index])
-        sample_idx = info['point_cloud']['lidar_idx']
-        points = self.get_lidar(sample_idx)
+        info = copy.deepcopy(self.infos[index])
+        pc_info = info["point_cloud"]
+        frame_id = str(info["frame_id"])
+        sequence_name = pc_info["lidar_sequence"]
+        sample_idx = int(pc_info["sample_idx"])
+
+        points = self.get_lidar(info["lidar_path"])
+        points = self.get_sequence_data(
+            info=info,
+            points=points,
+            sequence_name=sequence_name,
+            sample_idx=sample_idx,
+            max_sweeps=int(self.dataset_cfg.get("MAX_SWEEPS", 1)),
+        )
+
+        if self.dataset_cfg.get("SHIFT_COOR", None):
+            points[:, 0:3] += np.array(self.dataset_cfg.SHIFT_COOR, dtype=np.float32)
+
         input_dict = {
-            'frame_id': self.sample_id_list[index],
-            'points': points
+            "points": points,
+            "frame_id": frame_id,
+            "sample_idx": sample_idx,
+            "gt_boxes": None if self.training else np.empty((0, 7), dtype=np.float32),
+            "gt_names": np.empty((0)),
         }
 
-        if 'annos' in info:
-            annos = info['annos']
-            annos = common_utils.drop_info_with_name(annos, name='DontCare')
-            gt_names = annos['name']
-            gt_boxes_lidar = annos['gt_boxes_lidar']
-            input_dict.update({
-                'gt_names': gt_names,
-                'gt_boxes': gt_boxes_lidar
-            })
+        if self.dataset_cfg.get("USE_PSEUDO_LABEL", None) and self.training:
+            # Pseudo-label class IDs are fixed as 1:Vehicle 2:Pedestrian 3:Cyclist.
+            psid2clsid = {}
+            if "Vehicle" in self.class_names:
+                psid2clsid[1] = self.class_names.index("Vehicle") + 1
+            if "Pedestrian" in self.class_names:
+                psid2clsid[2] = self.class_names.index("Pedestrian") + 1
+            if "Cyclist" in self.class_names:
+                psid2clsid[3] = self.class_names.index("Cyclist") + 1
+
+            # Support lower-case class naming as well.
+            if "car" in self.class_names and 1 not in psid2clsid:
+                psid2clsid[1] = self.class_names.index("car") + 1
+            if "pedestrian" in self.class_names and 2 not in psid2clsid:
+                psid2clsid[2] = self.class_names.index("pedestrian") + 1
+            if "cyclist" in self.class_names and 3 not in psid2clsid:
+                psid2clsid[3] = self.class_names.index("cyclist") + 1
+
+            self.fill_pseudo_labels(input_dict, psid2clsid)
 
         data_dict = self.prepare_data(data_dict=input_dict)
-
         return data_dict
 
-    def evaluation(self, det_annos, class_names, **kwargs):
-        if 'annos' not in self.custom_infos[0].keys():
-            return 'No ground-truth boxes for evaluation', {}
-
-        def kitti_eval(eval_det_annos, eval_gt_annos, map_name_to_kitti):
-            from ..kitti.kitti_object_eval_python import eval as kitti_eval
-            from ..kitti import kitti_utils
-
-            kitti_utils.transform_annotations_to_kitti_format(eval_det_annos, map_name_to_kitti=map_name_to_kitti)
-            kitti_utils.transform_annotations_to_kitti_format(
-                eval_gt_annos, map_name_to_kitti=map_name_to_kitti,
-                info_with_fakelidar=self.dataset_cfg.get('INFO_WITH_FAKELIDAR', False)
-            )
-            kitti_class_names = [map_name_to_kitti[x] for x in class_names]
-            ap_result_str, ap_dict = kitti_eval.get_official_eval_result(
-                gt_annos=eval_gt_annos, dt_annos=eval_det_annos, current_classes=kitti_class_names
-            )
-            return ap_result_str, ap_dict
-
-        eval_det_annos = copy.deepcopy(det_annos)
-        eval_gt_annos = [copy.deepcopy(info['annos']) for info in self.custom_infos]
-
-        if kwargs['eval_metric'] == 'kitti':
-            ap_result_str, ap_dict = kitti_eval(eval_det_annos, eval_gt_annos, self.map_class_to_kitti)
-        else:
-            raise NotImplementedError
-
-        return ap_result_str, ap_dict
-
-    def get_infos(self, class_names, num_workers=4, has_label=True, sample_id_list=None, num_features=4):
-        import concurrent.futures as futures
-
-        def process_single_scene(sample_idx):
-            print('%s sample_idx: %s' % (self.split, sample_idx))
-            info = {}
-            pc_info = {'num_features': num_features, 'lidar_idx': sample_idx}
-            info['point_cloud'] = pc_info
-
-            if has_label:
-                annotations = {}
-                gt_boxes_lidar, name = self.get_label(sample_idx)
-                annotations['name'] = name
-                annotations['gt_boxes_lidar'] = gt_boxes_lidar[:, :7]
-                info['annos'] = annotations
-
-            return info
-
-        sample_id_list = sample_id_list if sample_id_list is not None else self.sample_id_list
-
-        # create a thread pool to improve the velocity
-        with futures.ThreadPoolExecutor(num_workers) as executor:
-            infos = executor.map(process_single_scene, sample_id_list)
-        return list(infos)
-
-    def create_groundtruth_database(self, info_path=None, used_classes=None, split='train'):
-        import torch
-
-        database_save_path = Path(self.root_path) / ('gt_database' if split == 'train' else ('gt_database_%s' % split))
-        db_info_save_path = Path(self.root_path) / ('custom_dbinfos_%s.pkl' % split)
-
-        database_save_path.mkdir(parents=True, exist_ok=True)
-        all_db_infos = {}
-
-        with open(info_path, 'rb') as f:
-            infos = pickle.load(f)
-
-        for k in range(len(infos)):
-            print('gt_database sample: %d/%d' % (k + 1, len(infos)))
-            info = infos[k]
-            sample_idx = info['point_cloud']['lidar_idx']
-            points = self.get_lidar(sample_idx)
-            annos = info['annos']
-            names = annos['name']
-            gt_boxes = annos['gt_boxes_lidar']
-
-            num_obj = gt_boxes.shape[0]
-            point_indices = roiaware_pool3d_utils.points_in_boxes_cpu(
-                torch.from_numpy(points[:, 0:3]), torch.from_numpy(gt_boxes)
-            ).numpy()  # (nboxes, npoints)
-
-            for i in range(num_obj):
-                filename = '%s_%s_%d.bin' % (sample_idx, names[i], i)
-                filepath = database_save_path / filename
-                gt_points = points[point_indices[i] > 0]
-
-                gt_points[:, :3] -= gt_boxes[i, :3]
-                with open(filepath, 'w') as f:
-                    gt_points.tofile(f)
-
-                if (used_classes is None) or names[i] in used_classes:
-                    db_path = str(filepath.relative_to(self.root_path))  # gt_database/xxxxx.bin
-                    db_info = {'name': names[i], 'path': db_path, 'gt_idx': i,
-                               'box3d_lidar': gt_boxes[i], 'num_points_in_gt': gt_points.shape[0]}
-                    if names[i] in all_db_infos:
-                        all_db_infos[names[i]].append(db_info)
-                    else:
-                        all_db_infos[names[i]] = [db_info]
-
-        # Output the num of all classes in database
-        for k, v in all_db_infos.items():
-            print('Database %s: %d' % (k, len(v)))
-
-        with open(db_info_save_path, 'wb') as f:
-            pickle.dump(all_db_infos, f)
-
     @staticmethod
-    def create_label_file_with_name_and_box(class_names, gt_names, gt_boxes, save_label_path):
-        with open(save_label_path, 'w') as f:
-            for idx in range(gt_boxes.shape[0]):
-                boxes = gt_boxes[idx]
-                name = gt_names[idx]
-                if name not in class_names:
+    def _save_pr_curve(output_path, pr_detail_dict, ap_dict):
+        try:
+            if output_path is None or not pr_detail_dict:
+                return
+
+            precision_all = np.asarray(pr_detail_dict.get("3d_precision", []), dtype=np.float32)
+            recall_all = np.asarray(pr_detail_dict.get("3d_recall", []), dtype=np.float32)
+            if precision_all.size == 0 or recall_all.size == 0:
+                return
+            if precision_all.ndim != 4 or recall_all.ndim != 4:
+                return
+
+            class_idx = 0
+            difficulty_idx = 1  # moderate
+            overlap_idx = 0  # Pedestrian IoU 0.50 in this eval setup
+
+            precision_curve_full = precision_all[class_idx, difficulty_idx, overlap_idx]
+            recall_curve_full = recall_all[class_idx, difficulty_idx, overlap_idx]
+            if precision_curve_full.size == 0 or recall_curve_full.size == 0:
+                return
+
+            # AP_R40 uses the 40 recall positions after the leading 0th sample.
+            if precision_curve_full.shape[0] > 1 and recall_curve_full.shape[0] > 1:
+                precision_curve = precision_curve_full[1:]
+                recall_curve = recall_curve_full[1:]
+            else:
+                precision_curve = precision_curve_full
+                recall_curve = recall_curve_full
+
+            ap_r40 = float(ap_dict.get("Pedestrian_3d/moderate_R40", np.nan))
+            output_dir = Path(output_path)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            npz_path = output_dir / "pr_curve_3d_pedestrian_moderate_R40_iou0.50.npz"
+            png_path = output_dir / "pr_curve_3d_pedestrian_moderate_R40_iou0.50.png"
+
+            np.savez(
+                npz_path,
+                recall=recall_curve,
+                precision=precision_curve,
+                recall_full=recall_curve_full,
+                precision_full=precision_curve_full,
+                ap_r40=np.float32(ap_r40),
+                difficulty="moderate",
+                metric="3d",
+                class_name="Pedestrian",
+                iou=np.float32(0.50),
+            )
+
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            fig, ax = plt.subplots(figsize=(7, 5))
+            ax.plot(recall_curve, precision_curve, color="#1f77b4", linewidth=2.0)
+            ax.set_xlim(0.0, 1.0)
+            ax.set_ylim(0.0, 1.0)
+            ax.set_xlabel("Recall")
+            ax.set_ylabel("Precision")
+            ax.set_title("Pedestrian 3D PR Curve")
+            ax.grid(True, alpha=0.3)
+            ax.legend([f"Moderate | IoU=0.50 | AP_R40={ap_r40:.2f}"], loc="lower left")
+            fig.tight_layout()
+            fig.savefig(png_path, dpi=220)
+            plt.close(fig)
+        except Exception:
+            return
+
+    def evaluation(self, det_annos, class_names, **kwargs):
+        # Custom target data is typically unlabeled.
+        if len(self.infos) == 0:
+            return None, {}
+        annos = self.infos[0].get("annos", None)
+        if annos is None or len(annos.get("gt_boxes_lidar", [])) == 0:
+            if self.logger is not None:
+                self.logger.info("Skipping evaluation - no gt annotations provided.")
+            return None, {}
+        eval_metric = kwargs.get("eval_metric", None)
+        if eval_metric != "kitti":
+            raise NotImplementedError(f"CustomDataset only supports eval_metric='kitti', got {eval_metric}")
+        output_path = kwargs.get("output_path", None)
+
+        from ..kitti.kitti_object_eval_python import eval as kitti_eval
+
+        def boxes_lidar_to_kitti_annos(annos_in, is_gt=False):
+            annos_out = copy.deepcopy(annos_in)
+            for anno in annos_out:
+                names = np.asarray(anno.get("name", []))
+                if names.size == 0:
+                    anno["name"] = names.astype("<U17")
+                    anno["bbox"] = np.zeros((0, 4), dtype=np.float32)
+                    anno["truncated"] = np.zeros(0, dtype=np.float32)
+                    anno["occluded"] = np.zeros(0, dtype=np.float32)
+                    anno["alpha"] = np.zeros(0, dtype=np.float32)
+                    anno["location"] = np.zeros((0, 3), dtype=np.float32)
+                    anno["dimensions"] = np.zeros((0, 3), dtype=np.float32)
+                    anno["rotation_y"] = np.zeros(0, dtype=np.float32)
+                    if is_gt:
+                        anno["difficulty"] = np.zeros(0, dtype=np.float32)
                     continue
-                line = "{x} {y} {z} {l} {w} {h} {angle} {name}\n".format(
-                    x=boxes[0], y=boxes[1], z=(boxes[2]), l=boxes[3],
-                    w=boxes[4], h=boxes[5], angle=boxes[6], name=name
+
+                if "boxes_lidar" in anno:
+                    boxes_lidar = np.asarray(anno["boxes_lidar"], dtype=np.float32).copy()
+                else:
+                    boxes_lidar = np.asarray(anno["gt_boxes_lidar"], dtype=np.float32).copy()
+
+                anno["name"] = names.astype("<U17")
+                anno["bbox"] = np.zeros((len(names), 4), dtype=np.float32)
+                anno["bbox"][:, 2:4] = 50.0
+                anno["truncated"] = np.zeros(len(names), dtype=np.float32)
+                anno["occluded"] = np.zeros(len(names), dtype=np.float32)
+
+                boxes_lidar[:, 2] -= boxes_lidar[:, 5] / 2.0
+                anno["location"] = np.zeros((boxes_lidar.shape[0], 3), dtype=np.float32)
+                anno["location"][:, 0] = -boxes_lidar[:, 1]
+                anno["location"][:, 1] = -boxes_lidar[:, 2]
+                anno["location"][:, 2] = boxes_lidar[:, 0]
+                anno["dimensions"] = boxes_lidar[:, 3:6][:, [0, 2, 1]]
+                anno["rotation_y"] = -boxes_lidar[:, 6] - np.pi / 2.0
+                anno["alpha"] = -np.arctan2(-boxes_lidar[:, 1], boxes_lidar[:, 0]) + anno["rotation_y"]
+
+                if is_gt:
+                    anno["difficulty"] = np.asarray(
+                        anno.get("difficulty", np.zeros(len(names), dtype=np.float32)), dtype=np.float32
+                    )
+
+            return annos_out
+
+        eval_det_annos = []
+        for anno in copy.deepcopy(det_annos):
+            names = np.asarray(anno.get("name", []))
+            if names.size == 0:
+                eval_det_annos.append(
+                    {
+                        "name": np.array([], dtype="<U17"),
+                        "score": np.zeros(0, dtype=np.float32),
+                        "boxes_lidar": np.zeros((0, 7), dtype=np.float32),
+                    }
                 )
-                f.write(line)
+                continue
 
+            ped_mask = names == "Pedestrian"
+            eval_det_annos.append(
+                {
+                    "name": names[ped_mask],
+                    "score": np.asarray(anno.get("score", np.zeros(len(names))), dtype=np.float32)[ped_mask],
+                    "boxes_lidar": np.asarray(anno.get("boxes_lidar", np.zeros((len(names), 7))), dtype=np.float32)[ped_mask],
+                }
+            )
 
-def create_custom_infos(dataset_cfg, class_names, data_path, save_path, workers=4):
-    dataset = CustomDataset(
-        dataset_cfg=dataset_cfg, class_names=class_names, root_path=data_path,
-        training=False, logger=common_utils.create_logger()
-    )
-    train_split, val_split = 'train', 'val'
-    num_features = len(dataset_cfg.POINT_FEATURE_ENCODING.src_feature_list)
+        eval_gt_annos = []
+        for info in self.infos:
+            annos = copy.deepcopy(info["annos"])
+            names = np.asarray(annos.get("name", []))
+            if names.size == 0:
+                eval_gt_annos.append(
+                    {
+                        "name": np.array([], dtype="<U17"),
+                        "gt_boxes_lidar": np.zeros((0, 7), dtype=np.float32),
+                        "difficulty": np.zeros(0, dtype=np.float32),
+                    }
+                )
+                continue
 
-    train_filename = save_path / ('custom_infos_%s.pkl' % train_split)
-    val_filename = save_path / ('custom_infos_%s.pkl' % val_split)
+            ped_mask = names == "Pedestrian"
+            eval_gt_annos.append(
+                {
+                    "name": names[ped_mask],
+                    "gt_boxes_lidar": np.asarray(annos.get("gt_boxes_lidar", np.zeros((len(names), 7))), dtype=np.float32)[ped_mask],
+                    "difficulty": np.asarray(annos.get("difficulty", np.zeros(len(names))), dtype=np.float32)[ped_mask],
+                }
+            )
 
-    print('------------------------Start to generate data infos------------------------')
+        eval_det_annos = boxes_lidar_to_kitti_annos(eval_det_annos, is_gt=False)
+        eval_gt_annos = boxes_lidar_to_kitti_annos(eval_gt_annos, is_gt=True)
 
-    dataset.set_split(train_split)
-    custom_infos_train = dataset.get_infos(
-        class_names, num_workers=workers, has_label=True, num_features=num_features
-    )
-    with open(train_filename, 'wb') as f:
-        pickle.dump(custom_infos_train, f)
-    print('Custom info train file is saved to %s' % train_filename)
-
-    dataset.set_split(val_split)
-    custom_infos_val = dataset.get_infos(
-        class_names, num_workers=workers, has_label=True, num_features=num_features
-    )
-    with open(val_filename, 'wb') as f:
-        pickle.dump(custom_infos_val, f)
-    print('Custom info train file is saved to %s' % val_filename)
-
-    print('------------------------Start create groundtruth database for data augmentation------------------------')
-    dataset.set_split(train_split)
-    dataset.create_groundtruth_database(train_filename, split=train_split)
-    print('------------------------Data preparation done------------------------')
-
-
-if __name__ == '__main__':
-    import sys
-
-    if sys.argv.__len__() > 1 and sys.argv[1] == 'create_custom_infos':
-        import yaml
-        from pathlib import Path
-        from easydict import EasyDict
-
-        dataset_cfg = EasyDict(yaml.safe_load(open(sys.argv[2])))
-        ROOT_DIR = (Path(__file__).resolve().parent / '../../../').resolve()
-        create_custom_infos(
-            dataset_cfg=dataset_cfg,
-            class_names=['Vehicle', 'Pedestrian', 'Cyclist'],
-            data_path=ROOT_DIR / 'data' / 'custom',
-            save_path=ROOT_DIR / 'data' / 'custom',
+        pr_detail_dict = {}
+        ap_result_str, ap_dict = kitti_eval.get_official_eval_result(
+            gt_annos=eval_gt_annos,
+            dt_annos=eval_det_annos,
+            current_classes=["Pedestrian"],
+            PR_detail_dict=pr_detail_dict,
         )
+        self._save_pr_curve(output_path=output_path, pr_detail_dict=pr_detail_dict, ap_dict=ap_dict)
+        return ap_result_str, ap_dict

@@ -1,0 +1,21 @@
+.git
+.codex
+build
+data
+output
+shared
+shared.zip
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.so
+pcdet.egg-info
+pcdet/models/*.pth
+ps_label/*.pkl
+tools/cfgs/target_custom/**/ps_labels/
+tools/temp.txt
+tools/CUSTOM_TARGET_PIPELINE.md
+Untitled Document 12
+tttttt
+pseudo_labeling_procedure.txt

@@ -100,4 +100,8 @@ WORKDIR /MS3D
 COPY . /MS3D
 
 RUN git config --global --add safe.directory /MS3D && \
+    chmod +x /MS3D/docker_entrypoint.sh && \
+    python setup.py build_ext --inplace && \
     python -m pip install -e . --no-build-isolation
+
+ENTRYPOINT ["/MS3D/docker_entrypoint.sh"]

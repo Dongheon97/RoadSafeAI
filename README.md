@@ -85,6 +85,8 @@ docker run --gpus all -d \
   tail -f /dev/null
 ```
 
+The container entrypoint checks whether CUDA extensions exist in the mounted workspace. On the first start with a fresh bind mount, it will run `python setup.py build_ext --inplace` inside `/MS3D` before executing the container command.
+
 Quick verification:
 
 ```bash
